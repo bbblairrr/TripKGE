@@ -1,0 +1,20 @@
+{
+  "methods": {
+    "graphrag_summary": {
+      "aggregated": {
+        "answer_relevancy": 0.051172861629779166,
+        "context_precision": 0.9799404761904762,
+        "context_recall": 0.7571045621045621,
+        "evidence_grounding_rate": 1.0,
+        "faithfulness": 1.0,
+        "feasibility_pass_rate": 0.7,
+        "personalization_proxy": 0.639,
+        "route_distance_ratio": 5.395739855336483
+      },
+      "n": 10
+    }
+  },
+  "meta": {
+    "limit": 10
+  }
+}

@@ -1,0 +1,17 @@
+# TripTailor-GraphRAG + local LLM inference (no cloud API)
+# Install: python3 -m pip install -r requirements-local-llm.txt
+
+# Base runtime
+neo4j>=5.20.0
+
+# Local LLM runtime (Transformers)
+torch>=2.2.0
+transformers>=4.45.0
+accelerate>=0.34.0
+safetensors>=0.4.3
+sentencepiece>=0.2.0
+protobuf>=4.25.3
+huggingface-hub>=0.24.0
+
+# Optional quantization (Linux/Windows recommended)
+bitsandbytes>=0.43.3; platform_system != "Darwin"

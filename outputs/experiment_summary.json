@@ -1,0 +1,77 @@
+{
+  "methods": {
+    "direct_llm": {
+      "aggregated": {
+        "answer_relevancy": 0.03553075443740345,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "evidence_grounding_rate": 0.0,
+        "faithfulness": 1.0,
+        "feasibility_pass_rate": 0.0,
+        "personalization_proxy": 0.6300000000000001,
+        "route_distance_ratio": 3.653083743851072,
+        "personalization_surpassing_rate": 0.0
+      },
+      "n": 2
+    },
+    "naive_rag": {
+      "aggregated": {
+        "answer_relevancy": 0.05150936533915257,
+        "context_precision": 0.9642857142857143,
+        "context_recall": 0.8055555555555556,
+        "evidence_grounding_rate": 1.0,
+        "faithfulness": 1.0,
+        "feasibility_pass_rate": 0.5,
+        "personalization_proxy": 0.6300000000000001,
+        "route_distance_ratio": 4.3899633218950145,
+        "personalization_surpassing_rate": 0.0
+      },
+      "n": 2
+    },
+    "kg_only": {
+      "aggregated": {
+        "answer_relevancy": 0.05540284295536396,
+        "context_precision": 0.7622377622377623,
+        "context_recall": 0.38675213675213677,
+        "evidence_grounding_rate": 0.7857142857142857,
+        "faithfulness": 1.0,
+        "feasibility_pass_rate": 1.0,
+        "personalization_proxy": 0.6000000000000001,
+        "route_distance_ratio": 0.8698540086311546,
+        "personalization_surpassing_rate": 0.0
+      },
+      "n": 2
+    },
+    "graphrag_no_summary": {
+      "aggregated": {
+        "answer_relevancy": 0.043200764764595896,
+        "context_precision": 0.7622377622377623,
+        "context_recall": 0.38675213675213677,
+        "evidence_grounding_rate": 0.7857142857142857,
+        "faithfulness": 1.0,
+        "feasibility_pass_rate": 1.0,
+        "personalization_proxy": 0.6000000000000001,
+        "route_distance_ratio": 0.8894963548438333,
+        "personalization_surpassing_rate": 0.0
+      },
+      "n": 2
+    },
+    "graphrag_summary": {
+      "aggregated": {
+        "answer_relevancy": 0.039874274164539834,
+        "context_precision": 0.7622377622377623,
+        "context_recall": 0.38675213675213677,
+        "evidence_grounding_rate": 0.7857142857142857,
+        "faithfulness": 1.0,
+        "feasibility_pass_rate": 1.0,
+        "personalization_proxy": 0.6000000000000001,
+        "route_distance_ratio": 0.9285310319856612,
+        "personalization_surpassing_rate": 0.0
+      },
+      "n": 2
+    }
+  },
+  "meta": {
+    "limit": 2
+  }
+}
