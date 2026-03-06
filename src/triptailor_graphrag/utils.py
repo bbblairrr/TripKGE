@@ -177,3 +177,60 @@ def unique_keep_order(items: Iterable[str]) -> list[str]:
         seen.add(item)
         ordered.append(item)
     return ordered
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def extract_json_payload(text: str | None) -> str | None:
+    if not text:
+        return None
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", text, re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+
+    start_positions = []
+    brace = text.find("{")
+    bracket = text.find("[")
+    if brace >= 0:
+        start_positions.append((brace, "{", "}"))
+    if bracket >= 0:
+        start_positions.append((bracket, "[", "]"))
+    if not start_positions:
+        return None
+
+    start, open_char, close_char = sorted(start_positions, key=lambda x: x[0])[0]
+    depth = 0
+    in_string = False
+    escape = False
+    begin = -1
+
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == open_char:
+            if depth == 0:
+                begin = idx
+            depth += 1
+            continue
+
+        if char == close_char and depth > 0:
+            depth -= 1
+            if depth == 0 and begin >= 0:
+                return text[begin : idx + 1].strip()
+
+    return None

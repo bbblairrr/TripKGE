@@ -9,6 +9,7 @@ from typing import Any
 from .config import AblationConfig, ExperimentConfig
 from .data_loader import DataLoader
 from .graph import GraphBuilder
+from .local_llm import LocalLLM, LocalPersonalizationJudge
 from .metrics import SampleMetric, aggregate_metrics, compute_sample_metrics
 from .pattern import PatternMiner
 from .planner import PlanGenerator
@@ -47,11 +48,17 @@ class TripTailorGraphRAGPipeline:
         )
         all_candidates = list(self.bundle.candidates_global.values())
         self.vector_index = TFIDFIndex(all_candidates)
+        self.local_llm = LocalLLM(self.config.local_llm)
 
         self.retriever = GraphEnhancedRetriever(self.graph, self.vector_index)
-        self.summarizer = EvidenceSummarizer()
-        self.planner = PlanGenerator(self.config, self.pattern_miner)
+        self.summarizer = EvidenceSummarizer(llm=self.local_llm)
+        self.planner = PlanGenerator(self.config, self.pattern_miner, llm=self.local_llm)
         self.validator = PlanValidator()
+        self.personalization_judge = (
+            LocalPersonalizationJudge(self.local_llm)
+            if self.config.local_llm.enabled and self.config.local_llm.enable_judge
+            else None
+        )
 
         self.query_by_pid = {q.pid: q for q in self.bundle.query_specs}
         self.sample_by_pid = {int(s["pid"]): s for s in self.bundle.test_samples}
@@ -73,7 +80,10 @@ class TripTailorGraphRAGPipeline:
             }
 
         if "direct_llm" in all_sample_metrics:
-            base = {x.pid: x.values.get("personalization_proxy", 0.0) for x in all_sample_metrics["direct_llm"]}
+            base = {
+                x.pid: x.values.get("personalization_score", x.values.get("personalization_proxy", 0.0))
+                for x in all_sample_metrics["direct_llm"]
+            }
             for method, rows in all_sample_metrics.items():
                 if method == "direct_llm":
                     results["methods"][method]["aggregated"]["personalization_surpassing_rate"] = 0.0
@@ -84,7 +94,8 @@ class TripTailorGraphRAGPipeline:
                     if row.pid not in base:
                         continue
                     total += 1
-                    if row.values.get("personalization_proxy", 0.0) > base[row.pid]:
+                    score = row.values.get("personalization_score", row.values.get("personalization_proxy", 0.0))
+                    if score > base[row.pid]:
                         wins += 1
                 rate = wins / total if total else 0.0
                 results["methods"][method]["aggregated"]["personalization_surpassing_rate"] = rate
@@ -102,6 +113,7 @@ class TripTailorGraphRAGPipeline:
             plan=plan,
             sample=sample,
             candidate_pool=self.bundle.candidates_by_pid[pid],
+            judge=self.personalization_judge,
         )
         return {
             "pid": pid,
@@ -125,6 +137,7 @@ class TripTailorGraphRAGPipeline:
                 plan=plan,
                 sample=sample,
                 candidate_pool=self.bundle.candidates_by_pid[pid],
+                judge=self.personalization_judge,
             )
             metrics.append(metric)
             outputs.append(

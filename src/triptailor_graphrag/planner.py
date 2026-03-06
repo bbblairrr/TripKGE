@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from .config import ExperimentConfig
+from .local_llm import LocalLLM
 from .pattern import PatternMiner
 from .types import Candidate, EvidenceSummary, PlanResult, QuerySpec
 
@@ -15,9 +17,10 @@ class CandidateIndex:
 
 
 class PlanGenerator:
-    def __init__(self, config: ExperimentConfig, pattern_miner: PatternMiner) -> None:
+    def __init__(self, config: ExperimentConfig, pattern_miner: PatternMiner, llm: LocalLLM | None = None) -> None:
         self.config = config
         self.pattern_miner = pattern_miner
+        self.llm = llm
         self.slot_time_map = {
             "morning": "09:00-10:30",
             "noon": "12:00-13:00",
@@ -46,9 +49,18 @@ class PlanGenerator:
         cindex = self._build_index(candidate_pool)
         chosen = [cid for cid in summary.chosen_ids if cid in cindex.by_id]
 
-        hotel_entry = self._pick_hotel(query, chosen, cindex)
         transportation = self._pick_transport(query, info)
-        itinerary = self._build_itinerary(query, chosen, cindex, summary.day_suggestions)
+        hotel_entry = self._pick_hotel(query, chosen, cindex)
+
+        llm_plan = None
+        if self.llm is not None and self.llm.enabled and self.llm.config.enable_planner:
+            llm_plan = self._generate_with_llm(query, summary, cindex)
+
+        if llm_plan is not None:
+            hotel_entry = llm_plan["hotel"]
+            itinerary = llm_plan["itinerary"]
+        else:
+            itinerary = self._build_itinerary(query, chosen, cindex, summary.day_suggestions)
 
         return PlanResult(
             query_pid=query.pid,
@@ -82,6 +94,114 @@ class PlanGenerator:
             c = fallback[0]
             return [{"day": 1, "name": c.name, "price_per_night": round(c.price, 2), "candidate_id": c.candidate_id}]
         return []
+
+    def _generate_with_llm(
+        self,
+        query: QuerySpec,
+        summary: EvidenceSummary,
+        cindex: CandidateIndex,
+    ) -> dict[str, Any] | None:
+        if self.llm is None:
+            return None
+
+        candidate_rows = []
+        for candidate_id in summary.chosen_ids:
+            candidate = cindex.by_id.get(candidate_id)
+            if candidate is None:
+                continue
+            candidate_rows.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "entity_type": candidate.entity_type,
+                    "name": candidate.name,
+                    "price": candidate.price,
+                    "tags": candidate.tags[:4],
+                    "city": candidate.city,
+                }
+            )
+
+        if not candidate_rows:
+            return None
+
+        heuristic_hotel = self._pick_hotel(query, summary.chosen_ids, cindex)
+        system_prompt = (
+            "You are a trip planning module. "
+            "Return only JSON with keys hotel_id and day_plans. "
+            "Use only candidate_id values from the provided candidates."
+        )
+        user_prompt = (
+            "Query:\n"
+            + json.dumps(
+                {
+                    "pid": query.pid,
+                    "query_text": query.query_text,
+                    "day": query.day,
+                    "budget": query.budget,
+                    "meal_price_range": query.meal_price_range,
+                    "hotel_category_pref": query.hotel_category_pref,
+                    "intensity_pref": query.intensity_pref,
+                    "interest_tags": query.interest_tags,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n\nEvidence summary:\n"
+            + json.dumps(
+                {
+                    "chosen_ids": summary.chosen_ids,
+                    "budget_risk": summary.budget_risk,
+                    "day_suggestions": summary.day_suggestions,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n\nCandidate shortlist:\n"
+            + json.dumps(candidate_rows, ensure_ascii=False, indent=2)
+            + "\n\nHeuristic hotel fallback:\n"
+            + json.dumps(heuristic_hotel, ensure_ascii=False, indent=2)
+            + "\n\nRules:\n"
+            + "1. day_plans must contain day numbers from 1 to "
+            + str(query.day)
+            + ".\n2. Each day should contain 2-6 candidate_ids.\n3. Use restaurant ids for dining and attraction ids for sightseeing.\n4. Do not use transport ids.\n5. Use only ids from the shortlist.\n\nOutput example:\n"
+            + '{"hotel_id":"hotel:city:name","day_plans":{"1":["attraction:1","restaurant:2"]}}'
+        )
+        payload = self.llm.generate_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_new_tokens=self.llm.config.planner_max_new_tokens,
+        )
+        if not payload:
+            return None
+
+        hotel_entry = heuristic_hotel
+        hotel_id = payload.get("hotel_id")
+        if isinstance(hotel_id, str):
+            hotel_candidate = cindex.by_id.get(hotel_id)
+            if hotel_candidate is not None and hotel_candidate.entity_type == "hotel":
+                hotel_entry = [
+                    {
+                        "day": 1,
+                        "name": hotel_candidate.name,
+                        "price_per_night": round(hotel_candidate.price, 2),
+                        "candidate_id": hotel_candidate.candidate_id,
+                    }
+                ]
+
+        day_plans_raw = payload.get("day_plans", {})
+        if not isinstance(day_plans_raw, dict):
+            return None
+
+        itinerary: dict[str, list[dict[str, Any]]] = {}
+        for day in range(1, query.day + 1):
+            raw_items = day_plans_raw.get(str(day), day_plans_raw.get(day, []))
+            if not isinstance(raw_items, list):
+                raw_items = []
+            activities = self._llm_day_to_activities(raw_items, cindex)
+            if not activities:
+                return None
+            itinerary[f"day_{day}"] = activities
+
+        return {"hotel": hotel_entry, "itinerary": itinerary}
 
     def _pick_transport(self, query: QuerySpec, info: dict[str, Any]) -> list[dict[str, Any]]:
         outbound = self._pick_one_transport(info.get("transport_otd", {}), query.departure_city, query.destination_city, day=1)
@@ -268,3 +388,22 @@ class PlanGenerator:
             if cand and cand.entity_type == entity_type:
                 return cand
         return None
+
+    def _llm_day_to_activities(self, candidate_ids: list[Any], cindex: CandidateIndex) -> list[dict[str, Any]]:
+        activities: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_id in candidate_ids:
+            if not isinstance(raw_id, str) or raw_id in seen:
+                continue
+            candidate = cindex.by_id.get(raw_id)
+            if candidate is None or candidate.entity_type not in {"attraction", "restaurant"}:
+                continue
+            action = "dining" if candidate.entity_type == "restaurant" else "sightseeing"
+            activities.append(self._activity_dict("unknown", action, candidate))
+            seen.add(raw_id)
+
+        if not activities:
+            return []
+
+        self._normalize_day_times(activities)
+        return activities

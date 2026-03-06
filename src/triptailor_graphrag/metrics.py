@@ -6,6 +6,7 @@ from statistics import mean
 from typing import Any
 
 from .data_loader import match_candidate_by_name
+from .local_llm import LocalPersonalizationJudge
 from .types import Candidate, PlanResult, QuerySpec
 from .utils import haversine_km, normalize_text, tokenize
 
@@ -23,6 +24,7 @@ def compute_sample_metrics(
     plan: PlanResult,
     sample: dict[str, Any],
     candidate_pool: list[Candidate],
+    judge: LocalPersonalizationJudge | None = None,
 ) -> SampleMetric:
     candidate_map = {c.candidate_id: c for c in candidate_pool}
 
@@ -53,10 +55,13 @@ def compute_sample_metrics(
     route_distance_ratio = route_pred / route_gt if route_gt > 0 else 1.0
 
     personalization_proxy = _personalization_proxy(query, plan, candidate_map)
+    judge_result = judge.score(query, plan, candidate_map) if judge is not None else None
+    personalization_score = judge_result.score if judge_result is not None else personalization_proxy
     answer_relevancy = _answer_relevancy(query, plan, candidate_map)
 
     values = {
         "feasibility_pass_rate": 1.0 if plan.validator_report.get("passed") else 0.0,
+        "personalization_score": personalization_score,
         "personalization_proxy": personalization_proxy,
         "route_distance_ratio": route_distance_ratio,
         "faithfulness": faithfulness,

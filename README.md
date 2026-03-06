@@ -30,6 +30,7 @@
 1. Baselines：`direct_llm / naive_rag / kg_only / graphrag_no_summary / graphrag_summary`
 2. 指标：
    - `feasibility_pass_rate`
+   - `personalization_score`（本地 LLM judge，未启用时回退到 proxy）
    - `personalization_proxy`（用于近似 Personalized Surpassing）
    - `route_distance_ratio`
    - `faithfulness`
@@ -61,16 +62,45 @@ python3 -m pip install -e .
 python3 -m pip install -e .[neo4j]
 ```
 
+如果要启用本地大模型推理，请安装：
+
+```bash
+python3 -m pip install -r requirements-local-llm.txt
+```
+
+或者：
+
+```bash
+python3 -m pip install -e .[local-llm]
+```
+
 ### 跑全方法实验（可加 `--limit` 先 smoke）
 
 ```bash
 python3 scripts/run_experiments.py --limit 50
 ```
 
+启用本地模型后，摘要层、规划层和个性化 judge 都会走 `transformers` 本地推理：
+
+```bash
+python3 scripts/run_experiments.py \
+  --limit 50 \
+  --local-llm-model /path/to/your-local-model
+```
+
 ### 跑单条样本
 
 ```bash
 python3 scripts/run_single.py --pid 1 --method graphrag_summary
+```
+
+单条样本启用本地模型：
+
+```bash
+python3 scripts/run_single.py \
+  --pid 1 \
+  --method graphrag_summary \
+  --local-llm-model /path/to/your-local-model
 ```
 
 ### 导出知识图谱到本地 Neo4j
@@ -141,6 +171,7 @@ python3 scripts/run_ablation.py \
 - `--normalize-weights`：自动归一化 `w-vector/w-constraint/w-graph`  
 - `--output-dir`：默认输出到 `outputs/ablation`
 - `--graph-source neo4j --neo4j-password ...`：消融时也从 Neo4j 读取图
+- `--local-llm-model /path/to/model`：消融时也启用本地模型
 
 ## 4. 输出
 
@@ -157,6 +188,7 @@ src/triptailor_graphrag/
   pattern.py
   graph.py
   neo4j_store.py
+  local_llm.py
   vector_index.py
   retrieval.py
   summarizer.py

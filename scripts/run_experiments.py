@@ -11,7 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from triptailor_graphrag.config import AblationConfig, ExperimentConfig, RetrievalWeights
+from triptailor_graphrag.config import AblationConfig, ExperimentConfig, LocalLLMConfig, RetrievalWeights
 from triptailor_graphrag.data_loader import DataLoader
 from triptailor_graphrag.graph import GraphBuilder
 from triptailor_graphrag.pattern import PatternMiner
@@ -32,6 +32,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-vector", type=float, default=0.5)
     parser.add_argument("--w-constraint", type=float, default=0.25)
     parser.add_argument("--w-graph", type=float, default=0.25)
+    parser.add_argument("--local-llm-model", default=None)
+    parser.add_argument("--local-llm-tokenizer", default=None)
+    parser.add_argument("--local-llm-device-map", default="auto")
+    parser.add_argument("--local-llm-dtype", default="auto")
+    parser.add_argument("--local-llm-temperature", type=float, default=0.0)
+    parser.add_argument("--local-llm-summary-tokens", type=int, default=512)
+    parser.add_argument("--local-llm-planner-tokens", type=int, default=768)
+    parser.add_argument("--local-llm-judge-tokens", type=int, default=160)
+    parser.add_argument("--disable-local-judge", action="store_true")
 
     parser.add_argument(
         "--graph-source",
@@ -83,6 +92,18 @@ def main() -> None:
             hops=args.hops,
             topk_vector=args.topk_vector,
             topk_final=args.topk_final,
+        ),
+        local_llm=LocalLLMConfig(
+            enabled=bool(args.local_llm_model),
+            model_path=args.local_llm_model,
+            tokenizer_path=args.local_llm_tokenizer,
+            device_map=args.local_llm_device_map,
+            torch_dtype=args.local_llm_dtype,
+            temperature=args.local_llm_temperature,
+            summary_max_new_tokens=args.local_llm_summary_tokens,
+            planner_max_new_tokens=args.local_llm_planner_tokens,
+            judge_max_new_tokens=args.local_llm_judge_tokens,
+            enable_judge=not args.disable_local_judge,
         ),
     )
 
