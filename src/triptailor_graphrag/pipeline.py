@@ -9,12 +9,14 @@ from typing import Any
 from .config import AblationConfig, ExperimentConfig
 from .data_loader import DataLoader
 from .graph import GraphBuilder
+from .local_llm import build_local_llm_client
 from .metrics import SampleMetric, aggregate_metrics, compute_sample_metrics
 from .pattern import PatternMiner
 from .planner import PlanGenerator
 from .retrieval import GraphEnhancedRetriever
 from .summarizer import EvidenceSummarizer
 from .types import Candidate, EvidenceSummary, PlanResult, QuerySpec
+from .utils import normalize_text, tokenize
 from .validator import PlanValidator
 from .vector_index import TFIDFIndex
 
@@ -50,7 +52,8 @@ class TripTailorGraphRAGPipeline:
 
         self.retriever = GraphEnhancedRetriever(self.graph, self.vector_index)
         self.summarizer = EvidenceSummarizer()
-        self.planner = PlanGenerator(self.config, self.pattern_miner)
+        self.llm_client = build_local_llm_client(self.config.llm)
+        self.planner = PlanGenerator(self.config, self.pattern_miner, llm_client=self.llm_client)
         self.validator = PlanValidator()
 
         self.query_by_pid = {q.pid: q for q in self.bundle.query_specs}
@@ -58,7 +61,14 @@ class TripTailorGraphRAGPipeline:
 
     def run_experiments(self, methods: list[str] | None = None, limit: int | None = None) -> dict[str, Any]:
         target_methods = methods or METHODS
-        results: dict[str, Any] = {"methods": {}, "meta": {"limit": limit}}
+        results: dict[str, Any] = {
+            "methods": {},
+            "meta": {
+                "limit": limit,
+                "llm_backend": self.config.llm.backend,
+                "llm_model": self.config.llm.model,
+            },
+        }
 
         all_sample_metrics: dict[str, list[SampleMetric]] = {}
         all_outputs: dict[str, list[dict[str, Any]]] = {}
@@ -233,27 +243,28 @@ class TripTailorGraphRAGPipeline:
         )
 
     def _direct_baseline_summary(self, query: QuerySpec, candidate_pool: list[Candidate]) -> EvidenceSummary:
-        hotels = sorted(
-            [c for c in candidate_pool if c.entity_type == "hotel"],
-            key=lambda x: x.price,
-            reverse=True,
-        )
+        hotels = sorted([c for c in candidate_pool if c.entity_type == "hotel"], key=lambda x: self._direct_candidate_rank(query, x))
         attractions = sorted(
             [c for c in candidate_pool if c.entity_type == "attraction"],
-            key=lambda x: x.price,
-            reverse=True,
+            key=lambda x: self._direct_candidate_rank(query, x),
         )
         restaurants = sorted(
             [c for c in candidate_pool if c.entity_type == "restaurant"],
-            key=lambda x: x.price,
-            reverse=True,
+            key=lambda x: self._direct_candidate_rank(query, x),
         )
 
         chosen_ids: list[str] = []
-        if hotels:
-            chosen_ids.append(hotels[0].candidate_id)
-        chosen_ids.extend([c.candidate_id for c in attractions[: max(4, query.day * 2)]])
-        chosen_ids.extend([c.candidate_id for c in restaurants[: max(4, query.day * 2)]])
+        hotel_cap = 4 if self.llm_client else 1
+        attr_cap = max(4, query.day * 2)
+        rest_cap = max(4, query.day * 2)
+        if self.llm_client:
+            attr_cap = max(attr_cap, min(10, self.config.llm.max_candidates // 2))
+            rest_cap = max(rest_cap, min(10, self.config.llm.max_candidates // 2))
+        chosen_ids.extend([c.candidate_id for c in hotels[:hotel_cap]])
+        chosen_ids.extend([c.candidate_id for c in attractions[:attr_cap]])
+        chosen_ids.extend([c.candidate_id for c in restaurants[:rest_cap]])
+        if self.llm_client:
+            chosen_ids = chosen_ids[: self.config.llm.max_candidates]
 
         return EvidenceSummary(
             query_pid=query.pid,
@@ -263,6 +274,23 @@ class TripTailorGraphRAGPipeline:
             day_suggestions={day: [] for day in range(1, query.day + 1)},
             trace_paths={},
         )
+
+    def _direct_candidate_rank(self, query: QuerySpec, candidate: Candidate) -> tuple[float, float]:
+        query_tokens = set(tokenize(query.query_text))
+        text_tokens = set(tokenize(candidate.text))
+        overlap = len(query_tokens.intersection(text_tokens))
+        interest_overlap = 0
+        if query.interest_tags:
+            wanted = {normalize_text(x) for x in query.interest_tags}
+            tags = {normalize_text(x) for x in candidate.tags}
+            interest_overlap = len(wanted.intersection(tags))
+        budget_penalty = 0.0
+        if query.meal_price_range and candidate.entity_type == "restaurant":
+            lo, hi = query.meal_price_range
+            budget_penalty = 0.0 if lo <= candidate.price <= hi else 1.0
+        elif query.budget is not None:
+            budget_penalty = candidate.price / max(query.budget, 1.0)
+        return (-interest_overlap - overlap, budget_penalty)
 
     def _write_outputs(self, summary: dict[str, Any], all_outputs: dict[str, list[dict[str, Any]]]) -> None:
         output_dir = Path(self.config.output_dir)

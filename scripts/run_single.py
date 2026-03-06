@@ -11,7 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from triptailor_graphrag.config import ExperimentConfig
+from triptailor_graphrag.config import ExperimentConfig, LocalLLMConfig
 from triptailor_graphrag.data_loader import DataLoader
 from triptailor_graphrag.graph import GraphBuilder
 from triptailor_graphrag.pattern import PatternMiner
@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", default="graphrag_summary", choices=METHODS)
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--llm-backend", default=None, choices=["ollama", "transformers"])
+    parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--llm-max-candidates", type=int, default=24)
+    parser.add_argument("--llm-temperature", type=float, default=0.0)
+    parser.add_argument("--llm-max-new-tokens", type=int, default=768)
+    parser.add_argument("--llm-timeout-seconds", type=int, default=120)
     parser.add_argument("--graph-source", default="local", choices=["local", "neo4j"])
     parser.add_argument("--neo4j-bootstrap", action="store_true")
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
@@ -37,7 +43,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = ExperimentConfig(data_dir=Path(args.data_dir))
+    llm_cfg = LocalLLMConfig(
+        backend=args.llm_backend,
+        model=args.llm_model,
+        max_candidates=args.llm_max_candidates,
+        temperature=args.llm_temperature,
+        max_new_tokens=args.llm_max_new_tokens,
+        timeout_seconds=args.llm_timeout_seconds,
+    )
+    config = ExperimentConfig(data_dir=Path(args.data_dir), llm=llm_cfg)
     graph_override = None
 
     if args.graph_source == "neo4j":

@@ -11,11 +11,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from triptailor_graphrag.config import AblationConfig, ExperimentConfig, RetrievalWeights
+from triptailor_graphrag.config import AblationConfig, ExperimentConfig, LocalLLMConfig, RetrievalWeights
 from triptailor_graphrag.data_loader import DataLoader
 from triptailor_graphrag.graph import GraphBuilder
 from triptailor_graphrag.pattern import PatternMiner
 from triptailor_graphrag.pipeline import METHODS, TripTailorGraphRAGPipeline
+from triptailor_graphrag.utils import slugify
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +25,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs", help="Output directory")
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     parser.add_argument("--limit", type=int, default=None, help="Only run first N test samples")
+    parser.add_argument("--llm-backend", default=None, choices=["ollama", "transformers"])
+    parser.add_argument("--llm-model", default=None, help="Single local model name or local path")
+    parser.add_argument(
+        "--llm-models",
+        nargs="+",
+        default=None,
+        help="Run the same experiment for multiple local models and compare outputs",
+    )
+    parser.add_argument("--llm-max-candidates", type=int, default=24)
+    parser.add_argument("--llm-temperature", type=float, default=0.0)
+    parser.add_argument("--llm-max-new-tokens", type=int, default=768)
+    parser.add_argument("--llm-timeout-seconds", type=int, default=120)
 
     parser.add_argument("--hops", type=int, default=2)
     parser.add_argument("--topk-vector", type=int, default=30)
@@ -57,6 +70,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_llm_runs(args: argparse.Namespace) -> list[LocalLLMConfig]:
+    models = args.llm_models or ([args.llm_model] if args.llm_model else [])
+    if not models:
+        return [LocalLLMConfig()]
+    if not args.llm_backend:
+        raise ValueError("--llm-backend is required when --llm-model or --llm-models is used")
+    return [
+        LocalLLMConfig(
+            backend=args.llm_backend,
+            model=model,
+            max_candidates=args.llm_max_candidates,
+            temperature=args.llm_temperature,
+            max_new_tokens=args.llm_max_new_tokens,
+            timeout_seconds=args.llm_timeout_seconds,
+        )
+        for model in models
+    ]
+
+
 def build_graph_from_local(config: ExperimentConfig):
     bundle = DataLoader(config.data_dir).load()
     miner = PatternMiner()
@@ -66,10 +98,10 @@ def build_graph_from_local(config: ExperimentConfig):
 
 def main() -> None:
     args = parse_args()
+    llm_runs = build_llm_runs(args)
 
-    config = ExperimentConfig(
+    base_kwargs = dict(
         data_dir=Path(args.data_dir),
-        output_dir=Path(args.output_dir),
         retrieval_weights=RetrievalWeights(
             vector=args.w_vector,
             constraint=args.w_constraint,
@@ -113,7 +145,8 @@ def main() -> None:
                         "Neo4j graph is empty. Run scripts/export_neo4j.py once, "
                         "or pass --neo4j-bootstrap to build and write once."
                     )
-                boot_graph = build_graph_from_local(config)
+                bootstrap_cfg = ExperimentConfig(output_dir=Path(args.output_dir), llm=LocalLLMConfig(), **base_kwargs)
+                boot_graph = build_graph_from_local(bootstrap_cfg)
                 stats = store.persist_graph(boot_graph, clear_existing=args.neo4j_clear)
                 print(
                     f"Bootstrapped Neo4j graph: nodes={stats['node_count']}, "
@@ -121,38 +154,65 @@ def main() -> None:
                 )
                 graph_override = store.load_graph()
 
-    pipeline = TripTailorGraphRAGPipeline(config=config, graph_override=graph_override)
+    all_runs: dict[str, dict[str, object]] = {}
+    export_done = False
+    multiple_models = len(llm_runs) > 1
+    for llm_cfg in llm_runs:
+        model_label = llm_cfg.model or "heuristic"
+        run_out = Path(args.output_dir)
+        if multiple_models:
+            run_out = run_out / slugify(model_label)
 
-    if args.export_neo4j:
-        if not args.neo4j_password:
-            raise ValueError("--neo4j-password is required when --export-neo4j is enabled")
+        config = ExperimentConfig(output_dir=run_out, llm=llm_cfg, **base_kwargs)
+        pipeline = TripTailorGraphRAGPipeline(config=config, graph_override=graph_override)
 
-        from triptailor_graphrag.neo4j_store import Neo4jConnConfig, Neo4jGraphStore
+        if args.export_neo4j and not export_done:
+            if not args.neo4j_password:
+                raise ValueError("--neo4j-password is required when --export-neo4j is enabled")
 
-        conn = Neo4jConnConfig(
-            uri=args.neo4j_uri,
-            user=args.neo4j_user,
-            password=args.neo4j_password,
-            database=args.neo4j_database,
-            batch_size=args.neo4j_batch_size,
-        )
-        with Neo4jGraphStore(conn) as store:
-            stats = store.persist_graph(pipeline.graph, clear_existing=args.neo4j_clear)
-            print(
-                f"Neo4j import finished: nodes={stats['node_count']}, "
-                f"edges={stats['edge_count']}, uri={args.neo4j_uri}, db={args.neo4j_database}"
+            from triptailor_graphrag.neo4j_store import Neo4jConnConfig, Neo4jGraphStore
+
+            conn = Neo4jConnConfig(
+                uri=args.neo4j_uri,
+                user=args.neo4j_user,
+                password=args.neo4j_password,
+                database=args.neo4j_database,
+                batch_size=args.neo4j_batch_size,
             )
-            if args.neo4j_cypher_out:
-                out = store.dump_cypher(
-                    pipeline.graph,
-                    args.neo4j_cypher_out,
-                    clear_existing=args.neo4j_clear,
+            with Neo4jGraphStore(conn) as store:
+                stats = store.persist_graph(pipeline.graph, clear_existing=args.neo4j_clear)
+                print(
+                    f"Neo4j import finished: nodes={stats['node_count']}, "
+                    f"edges={stats['edge_count']}, uri={args.neo4j_uri}, db={args.neo4j_database}"
                 )
-                print(f"Neo4j cypher dump saved: {out.resolve()}")
+                if args.neo4j_cypher_out:
+                    out = store.dump_cypher(
+                        pipeline.graph,
+                        args.neo4j_cypher_out,
+                        clear_existing=args.neo4j_clear,
+                    )
+                    print(f"Neo4j cypher dump saved: {out.resolve()}")
+            export_done = True
 
-    summary = pipeline.run_experiments(methods=args.methods, limit=args.limit)
+        summary = pipeline.run_experiments(methods=args.methods, limit=args.limit)
+        all_runs[model_label] = summary
 
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if multiple_models:
+        payload: dict[str, object] = {
+            "models": all_runs,
+            "meta": {
+                "limit": args.limit,
+                "methods": args.methods,
+                "llm_backend": args.llm_backend,
+            },
+        }
+        summary_path = Path(args.output_dir) / "experiment_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        payload = next(iter(all_runs.values()))
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"Saved outputs to: {Path(args.output_dir).resolve()}")
 
 

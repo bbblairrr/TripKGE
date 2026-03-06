@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from .config import ExperimentConfig
+from .local_llm import LocalLLMClient, LocalLLMError
 from .pattern import PatternMiner
 from .types import Candidate, EvidenceSummary, PlanResult, QuerySpec
+from .utils import normalize_text
 
 
 @dataclass
@@ -15,9 +19,15 @@ class CandidateIndex:
 
 
 class PlanGenerator:
-    def __init__(self, config: ExperimentConfig, pattern_miner: PatternMiner) -> None:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        pattern_miner: PatternMiner,
+        llm_client: LocalLLMClient | None = None,
+    ) -> None:
         self.config = config
         self.pattern_miner = pattern_miner
+        self.llm_client = llm_client
         self.slot_time_map = {
             "morning": "09:00-10:30",
             "noon": "12:00-13:00",
@@ -46,6 +56,11 @@ class PlanGenerator:
         cindex = self._build_index(candidate_pool)
         chosen = [cid for cid in summary.chosen_ids if cid in cindex.by_id]
 
+        if self.llm_client is not None:
+            llm_plan = self._generate_with_llm(query, summary, candidate_pool, info, cindex)
+            if llm_plan is not None:
+                return llm_plan
+
         hotel_entry = self._pick_hotel(query, chosen, cindex)
         transportation = self._pick_transport(query, info)
         itinerary = self._build_itinerary(query, chosen, cindex, summary.day_suggestions)
@@ -59,6 +74,35 @@ class PlanGenerator:
             evidence_ids=summary.chosen_ids,
             validator_report={},
         )
+
+    def _generate_with_llm(
+        self,
+        query: QuerySpec,
+        summary: EvidenceSummary,
+        candidate_pool: list[Candidate],
+        info: dict[str, Any],
+        cindex: CandidateIndex,
+    ) -> PlanResult | None:
+        try:
+            prompt = self._build_llm_prompt(query, summary, candidate_pool, cindex)
+            response = self.llm_client.generate(prompt, system_prompt=self._llm_system_prompt())
+            payload = self._parse_llm_json(response)
+            hotel_entry = self._llm_pick_hotel(payload, query, summary, cindex)
+            transportation = self._pick_transport(query, info)
+            itinerary = self._llm_build_itinerary(payload, query, summary, cindex)
+            return PlanResult(
+                query_pid=query.pid,
+                hotel=hotel_entry,
+                transportation=transportation,
+                itinerary=itinerary,
+                candidate_pool=[c.candidate_id for c in candidate_pool],
+                evidence_ids=summary.chosen_ids,
+                validator_report={},
+            )
+        except (LocalLLMError, ValueError, KeyError, json.JSONDecodeError):
+            if not self.config.llm.fallback_to_heuristic:
+                raise
+            return None
 
     def _build_index(self, candidate_pool: list[Candidate]) -> CandidateIndex:
         by_id = {c.candidate_id: c for c in candidate_pool}
@@ -82,6 +126,19 @@ class PlanGenerator:
             c = fallback[0]
             return [{"day": 1, "name": c.name, "price_per_night": round(c.price, 2), "candidate_id": c.candidate_id}]
         return []
+
+    def _llm_pick_hotel(
+        self,
+        payload: dict[str, Any],
+        query: QuerySpec,
+        summary: EvidenceSummary,
+        cindex: CandidateIndex,
+    ) -> list[dict[str, Any]]:
+        hotel_ref = str(payload.get("hotel_candidate_id") or "").strip()
+        hotel = self._resolve_candidate_ref(hotel_ref, cindex, entity_type="hotel") if hotel_ref else None
+        if hotel is None:
+            return self._pick_hotel(query, summary.chosen_ids, cindex)
+        return [{"day": 1, "name": hotel.name, "price_per_night": round(hotel.price, 2), "candidate_id": hotel.candidate_id}]
 
     def _pick_transport(self, query: QuerySpec, info: dict[str, Any]) -> list[dict[str, Any]]:
         outbound = self._pick_one_transport(info.get("transport_otd", {}), query.departure_city, query.destination_city, day=1)
@@ -208,6 +265,57 @@ class PlanGenerator:
 
         return itinerary
 
+    def _llm_build_itinerary(
+        self,
+        payload: dict[str, Any],
+        query: QuerySpec,
+        summary: EvidenceSummary,
+        cindex: CandidateIndex,
+    ) -> dict[str, list[dict[str, Any]]]:
+        days_payload = payload.get("days", {})
+        if not isinstance(days_payload, dict):
+            raise ValueError("LLM output missing `days` object.")
+
+        chosen_ids = [cid for cid in summary.chosen_ids if cid in cindex.by_id]
+        chosen_attractions = [
+            cindex.by_id[cid]
+            for cid in chosen_ids
+            if cindex.by_id[cid].entity_type == "attraction"
+        ]
+        chosen_restaurants = [
+            cindex.by_id[cid]
+            for cid in chosen_ids
+            if cindex.by_id[cid].entity_type == "restaurant"
+        ]
+
+        itinerary: dict[str, list[dict[str, Any]]] = {}
+        used_ids: set[str] = set()
+        for day_idx in range(1, query.day + 1):
+            raw_items = days_payload.get(str(day_idx), [])
+            activities: list[dict[str, Any]] = []
+            day_used: set[str] = set()
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        continue
+                    action = str(item.get("action") or "").strip().lower()
+                    if action not in {"sightseeing", "dining"}:
+                        continue
+                    expected_type = "attraction" if action == "sightseeing" else "restaurant"
+                    ref = str(item.get("candidate_id") or item.get("name") or "").strip()
+                    cand = self._resolve_candidate_ref(ref, cindex, entity_type=expected_type)
+                    if cand is None or cand.candidate_id in day_used:
+                        continue
+                    activities.append(self._activity_dict("unknown", action, cand))
+                    day_used.add(cand.candidate_id)
+                    used_ids.add(cand.candidate_id)
+
+            if not activities:
+                activities = self._fallback_day(query, day_idx, chosen_attractions, chosen_restaurants, used_ids)
+            self._normalize_day_times(activities)
+            itinerary[f"day_{day_idx}"] = activities
+        return itinerary
+
     def _next_unused(self, items: list[Candidate], used_ids: set[str], start_index: int = 0) -> Candidate | None:
         if not items:
             return None
@@ -266,5 +374,96 @@ class PlanGenerator:
                 continue
             cand = cindex.by_id.get(cid)
             if cand and cand.entity_type == entity_type:
+                return cand
+        return None
+
+    def _llm_system_prompt(self) -> str:
+        return (
+            "You are a travel planner. Output valid JSON only. "
+            "Never invent candidate ids. Only use ids from the provided shortlist."
+        )
+
+    def _build_llm_prompt(
+        self,
+        query: QuerySpec,
+        summary: EvidenceSummary,
+        candidate_pool: list[Candidate],
+        cindex: CandidateIndex,
+    ) -> str:
+        preferred_ids = [cid for cid in summary.chosen_ids if cid in cindex.by_id]
+        if not preferred_ids:
+            preferred_ids = [c.candidate_id for c in candidate_pool[: self.config.llm.max_candidates]]
+        preferred_ids = preferred_ids[: self.config.llm.max_candidates]
+
+        candidate_lines = []
+        for cid in preferred_ids:
+            cand = cindex.by_id[cid]
+            tag_str = ", ".join(cand.tags[:4]) if cand.tags else "none"
+            candidate_lines.append(
+                f"- id={cand.candidate_id}; type={cand.entity_type}; name={cand.name}; "
+                f"price={cand.price:.2f}; tags={tag_str}; text={cand.text}"
+            )
+
+        constraints = [
+            f"trip_days={query.day}",
+            f"departure_city={query.departure_city}",
+            f"destination_city={query.destination_city}",
+            f"budget={query.budget if query.budget is not None else 'unknown'}",
+            f"meal_price_range={query.meal_price_range if query.meal_price_range else 'unknown'}",
+            f"hotel_category_pref={query.hotel_category_pref or 'none'}",
+            f"intensity_pref={query.intensity_pref or 'none'}",
+            f"interest_tags={query.interest_tags or []}",
+            f"budget_risk_hint={summary.budget_risk}",
+        ]
+        output_schema = {
+            "hotel_candidate_id": "one hotel candidate id",
+            "days": {
+                "1": [
+                    {"candidate_id": "attraction or restaurant id", "action": "sightseeing or dining"},
+                ],
+            },
+        }
+        return (
+            "Plan a personalized itinerary from the candidate shortlist.\n"
+            "Use 2 to 5 activities per day. Prefer varied attractions and restaurants. "
+            "Respect budget and preferences.\n\n"
+            "Query constraints:\n"
+            + "\n".join(f"- {line}" for line in constraints)
+            + "\n\nCandidate shortlist:\n"
+            + "\n".join(candidate_lines)
+            + "\n\nReturn JSON with this schema:\n"
+            + json.dumps(output_schema, ensure_ascii=False, indent=2)
+        )
+
+    def _parse_llm_json(self, text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+            if not match:
+                raise
+            return json.loads(match.group(0))
+
+    def _resolve_candidate_ref(
+        self,
+        ref: str,
+        cindex: CandidateIndex,
+        entity_type: str | None = None,
+    ) -> Candidate | None:
+        if not ref:
+            return None
+        if ref in cindex.by_id:
+            cand = cindex.by_id[ref]
+            return cand if entity_type is None or cand.entity_type == entity_type else None
+
+        target = normalize_text(ref)
+        for cand in cindex.by_id.values():
+            if entity_type is not None and cand.entity_type != entity_type:
+                continue
+            name = normalize_text(cand.name)
+            if target == name or target in name or name in target:
                 return cand
         return None

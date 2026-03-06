@@ -170,3 +170,37 @@ scripts/
   run_ablation.py
   export_neo4j.py
 ```
+## Local LLM Usage
+
+Install local inference dependencies:
+
+```bash
+python3 -m pip install -r requirements-local-llm.txt
+```
+
+Run one sample with a local model:
+
+```bash
+python3 scripts/run_single.py \
+  --pid 1 \
+  --method graphrag_summary \
+  --llm-backend ollama \
+  --llm-model qwen2.5-coder:7b
+```
+
+Compare multiple local models:
+
+```bash
+python3 scripts/run_experiments.py \
+  --methods direct_llm graphrag_summary \
+  --limit 20 \
+  --llm-backend ollama \
+  --llm-models qwen2.5-coder:7b deepseek-r1:8b mistral:latest \
+  --output-dir outputs/model_compare
+```
+
+Notes:
+
+- With `--llm-backend` and `--llm-model`, the planning stage uses the local model to choose a hotel and build each day itinerary.
+- Without LLM arguments, the project keeps using the existing heuristic planner.
+- Multi-model comparison writes each run into `outputs/model_compare/<model_name>/`.

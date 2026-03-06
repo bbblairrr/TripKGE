@@ -5,6 +5,17 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
+class LocalLLMConfig:
+    backend: str | None = None
+    model: str | None = None
+    max_candidates: int = 24
+    temperature: float = 0.0
+    max_new_tokens: int = 768
+    timeout_seconds: int = 120
+    fallback_to_heuristic: bool = True
+
+
+@dataclass(frozen=True)
 class RetrievalWeights:
     vector: float = 0.5
     constraint: float = 0.25
@@ -32,3 +43,4 @@ class ExperimentConfig:
     retrieval_weights: RetrievalWeights = RetrievalWeights()
     ablation: AblationConfig = AblationConfig()
     random_seed: int = 42
+    llm: LocalLLMConfig = LocalLLMConfig()
