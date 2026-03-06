@@ -1,20 +1,162 @@
-/.DS_Store
-# 忽略特定文件
-*.log
-*.tmp
-*.swp
+# ================================
+# Python 项目忽略规则
+# ================================
 
-# 忽略特定目录
+# 字节编译/优化文件
+*.py[cod]
+*$py.class
+*.so
+
+# 缓存目录
 __pycache__/
-*.pyc
-.env
-.idea/
-.vscode/
+*.py[cod]
+.cache/
 
-# 忽略特定路径
-dist/
+# 分发/打包文件
 build/
-node_modules/
+dist/
+*.egg-info/
+*.egg
+*.manifest
+*.spec
 
-# 忽略所有 txt 文件
-*.txt
+# 安装文件
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 单元测试覆盖
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.coveragerc
+.pytest_cache/
+
+# Jupyter Notebook 缓存
+.ipynb_checkpoints/
+
+# ================================
+# 环境和配置
+# ================================
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# 配置文件（含敏感信息）
+config.local.py
+settings.local.py
+*.secret
+*.key
+
+# ================================
+# IDE 和编辑器
+# ================================
+
+# PyCharm
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.*.elc
+
+# ================================
+# 操作系统文件
+# ================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.Trash-*
+.nfs*
+
+# ================================
+# 日志和临时文件
+# ================================
+
+# 日志文件
+*.log
+logs/
+*.log.*
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# ================================
+# 数据和文档
+# ================================
+
+
+
+# 文档构建
+docs/_build/
+site/
+
+# ================================
+# Git 相关
+# ================================
+
+# Git 文件
+.git/
+.gitignore
+.gitattributes
+.gitmodules
+
+# ================================
+# 其他常见忽略
+# ================================
+
+# Node.js（如有前端）
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# 压缩文件
+*.zip
+*.tar.gz
+*.rar
+
+# 备份文件
+*.backup
+*.old
+# Python 字节码
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
