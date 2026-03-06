@@ -196,11 +196,30 @@ python3 scripts/run_experiments.py \
   --limit 20 \
   --llm-backend ollama \
   --llm-models qwen2.5-coder:7b deepseek-r1:8b mistral:latest \
+  --judge-llm-backend ollama \
+  --judge-llm-model qwen2.5-coder:7b \
   --output-dir outputs/model_compare
 ```
 
 Notes:
 
 - With `--llm-backend` and `--llm-model`, the planning stage uses the local model to choose a hotel and build each day itinerary.
+- With `--judge-llm-backend` and `--judge-llm-model`, the personalization metric is scored by an LLM judge using blind A/B comparison between the generated itinerary and the dataset reference itinerary.
 - Without LLM arguments, the project keeps using the existing heuristic planner.
 - Multi-model comparison writes each run into `outputs/model_compare/<model_name>/`.
+
+## Metric Notes
+
+- `feasibility_pass_rate`: hallucination-based feasibility. A plan is infeasible if transport details do not match sandbox options or POIs/hotels cannot be grounded to sandbox candidates.
+- `constraint_satisfaction_rate`: the original validator pass signal for budget, meal range, time, deduplication, and route checks.
+- `schema_validity_rate`: whether the generated plan structure and required fields are well-formed.
+- `entity_grounding_rate`: the share of hotel and POI entries that can be matched back to sandbox candidates.
+- `transport_grounding_rate`: the share of outbound/inbound transport details that can be matched back to sandbox transport options.
+- `opening_hours_compliance`: the share of sightseeing activities that fit inside the attraction opening hours.
+- `stay_duration_feasibility`: the share of activities whose allocated time slot can cover the required stay duration.
+- `transport_time_feasibility`: whether outbound arrival and inbound departure times are compatible with first-day and last-day activities.
+- `personalization_proxy`: an LLM-judge preference score from blind A/B comparison between the generated itinerary and the dataset reference itinerary for the same user request. The judge only sees `Itinerary A` and `Itinerary B`, with stable randomized order. If no judge model is configured, it falls back to the previous heuristic score.
+- `average_route_distance_ratio`: average per-day route distance divided by the ground-truth average per-day route distance.
+- `max_single_day_route_km`: the longest single-day route distance in the generated plan.
+- Retrieval metrics now include `recall_at_5`, `recall_at_10`, `ndcg_at_5`, and `ndcg_at_10`.
+- `answer_relevancy` uses local embedding cosine similarity by default, with lexical fallback if the local embedding model is unavailable.

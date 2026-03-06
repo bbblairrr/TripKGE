@@ -13,6 +13,7 @@ from .local_llm import build_local_llm_client
 from .metrics import SampleMetric, aggregate_metrics, compute_sample_metrics
 from .pattern import PatternMiner
 from .planner import PlanGenerator
+from .preference_judge import PreferenceJudge
 from .retrieval import GraphEnhancedRetriever
 from .summarizer import EvidenceSummarizer
 from .types import Candidate, EvidenceSummary, PlanResult, QuerySpec
@@ -53,6 +54,8 @@ class TripTailorGraphRAGPipeline:
         self.retriever = GraphEnhancedRetriever(self.graph, self.vector_index)
         self.summarizer = EvidenceSummarizer()
         self.llm_client = build_local_llm_client(self.config.llm)
+        self.judge_llm_client = build_local_llm_client(self.config.judge_llm)
+        self.preference_judge = PreferenceJudge(self.judge_llm_client)
         self.planner = PlanGenerator(self.config, self.pattern_miner, llm_client=self.llm_client)
         self.validator = PlanValidator()
 
@@ -67,6 +70,8 @@ class TripTailorGraphRAGPipeline:
                 "limit": limit,
                 "llm_backend": self.config.llm.backend,
                 "llm_model": self.config.llm.model,
+                "judge_llm_backend": self.config.judge_llm.backend,
+                "judge_llm_model": self.config.judge_llm.model,
             },
         }
 
@@ -112,6 +117,8 @@ class TripTailorGraphRAGPipeline:
             plan=plan,
             sample=sample,
             candidate_pool=self.bundle.candidates_by_pid[pid],
+            info=self.bundle.info_by_pid.get(str(pid), {}),
+            preference_judge=self.preference_judge,
         )
         return {
             "pid": pid,
@@ -135,6 +142,8 @@ class TripTailorGraphRAGPipeline:
                 plan=plan,
                 sample=sample,
                 candidate_pool=self.bundle.candidates_by_pid[pid],
+                info=self.bundle.info_by_pid.get(str(pid), {}),
+                preference_judge=self.preference_judge,
             )
             metrics.append(metric)
             outputs.append(

@@ -44,3 +44,4 @@ class ExperimentConfig:
     ablation: AblationConfig = AblationConfig()
     random_seed: int = 42
     llm: LocalLLMConfig = LocalLLMConfig()
+    judge_llm: LocalLLMConfig = LocalLLMConfig()

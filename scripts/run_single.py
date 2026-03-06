@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--llm-max-new-tokens", type=int, default=768)
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
+    parser.add_argument("--judge-llm-model", default=None)
+    parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
+    parser.add_argument("--judge-llm-max-new-tokens", type=int, default=384)
+    parser.add_argument("--judge-llm-timeout-seconds", type=int, default=120)
     parser.add_argument("--graph-source", default="local", choices=["local", "neo4j"])
     parser.add_argument("--neo4j-bootstrap", action="store_true")
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
@@ -51,7 +56,14 @@ def main() -> None:
         max_new_tokens=args.llm_max_new_tokens,
         timeout_seconds=args.llm_timeout_seconds,
     )
-    config = ExperimentConfig(data_dir=Path(args.data_dir), llm=llm_cfg)
+    judge_llm_cfg = LocalLLMConfig(
+        backend=args.judge_llm_backend,
+        model=args.judge_llm_model,
+        temperature=args.judge_llm_temperature,
+        max_new_tokens=args.judge_llm_max_new_tokens,
+        timeout_seconds=args.judge_llm_timeout_seconds,
+    )
+    config = ExperimentConfig(data_dir=Path(args.data_dir), llm=llm_cfg, judge_llm=judge_llm_cfg)
     graph_override = None
 
     if args.graph_source == "neo4j":

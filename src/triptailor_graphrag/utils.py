@@ -5,6 +5,12 @@ import re
 import unicodedata
 from typing import Iterable
 
+DURATION_RANGE_PATTERN = re.compile(
+    r"([0-9]+(?:\.[0-9]+)?)\s*(?:to|-)\s*([0-9]+(?:\.[0-9]+)?)\s*(minutes?|hours?|days?)",
+    re.IGNORECASE,
+)
+DURATION_SINGLE_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(minutes?|hours?|days?)", re.IGNORECASE)
+
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]", re.IGNORECASE)
 TIME_RANGE_PATTERN = re.compile(r"(\d{1,2}:\d{2})\s*[\-–—~]\s*(\d{1,2}:\d{2})")
 BUDGET_PATTERN = re.compile(r"budget of [¥$]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
@@ -153,6 +159,28 @@ def parse_time_range(value: str | None) -> tuple[int, int] | None:
     return start, end
 
 
+def parse_opening_hours(value: str | None) -> tuple[int, int] | None:
+    normalized = normalize_text(value)
+    if not normalized:
+        return None
+    if "24/7" in normalized or "24 hours" in normalized:
+        return 0, 24 * 60
+    return parse_time_range(value)
+
+
+def parse_duration_minutes(value: str | None) -> int | None:
+    normalized = normalize_text(value)
+    if not normalized:
+        return None
+    match = DURATION_RANGE_PATTERN.search(normalized)
+    if match:
+        return _duration_value_to_minutes(float(match.group(1)), match.group(3))
+    match = DURATION_SINGLE_PATTERN.search(normalized)
+    if match:
+        return _duration_value_to_minutes(float(match.group(1)), match.group(2))
+    return None
+
+
 def intervals_overlap(interval_a: tuple[int, int], interval_b: tuple[int, int]) -> bool:
     return interval_a[0] < interval_b[1] and interval_b[0] < interval_a[1]
 
@@ -177,3 +205,14 @@ def unique_keep_order(items: Iterable[str]) -> list[str]:
         seen.add(item)
         ordered.append(item)
     return ordered
+
+
+def _duration_value_to_minutes(value: float, unit: str) -> int:
+    unit_norm = normalize_text(unit)
+    if unit_norm.startswith("minute"):
+        return int(round(value))
+    if unit_norm.startswith("hour"):
+        return int(round(value * 60))
+    if unit_norm.startswith("day"):
+        return int(round(value * 8 * 60))
+    return int(round(value))

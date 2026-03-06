@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--llm-max-new-tokens", type=int, default=768)
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
+    parser.add_argument("--judge-llm-model", default=None, help="Local judge model used for personalization comparison")
+    parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
+    parser.add_argument("--judge-llm-max-new-tokens", type=int, default=384)
+    parser.add_argument("--judge-llm-timeout-seconds", type=int, default=120)
 
     parser.add_argument("--hops", type=int, default=2)
     parser.add_argument("--topk-vector", type=int, default=30)
@@ -99,6 +104,13 @@ def build_graph_from_local(config: ExperimentConfig):
 def main() -> None:
     args = parse_args()
     llm_runs = build_llm_runs(args)
+    judge_llm_cfg = LocalLLMConfig(
+        backend=args.judge_llm_backend,
+        model=args.judge_llm_model,
+        temperature=args.judge_llm_temperature,
+        max_new_tokens=args.judge_llm_max_new_tokens,
+        timeout_seconds=args.judge_llm_timeout_seconds,
+    )
 
     base_kwargs = dict(
         data_dir=Path(args.data_dir),
@@ -145,7 +157,12 @@ def main() -> None:
                         "Neo4j graph is empty. Run scripts/export_neo4j.py once, "
                         "or pass --neo4j-bootstrap to build and write once."
                     )
-                bootstrap_cfg = ExperimentConfig(output_dir=Path(args.output_dir), llm=LocalLLMConfig(), **base_kwargs)
+                bootstrap_cfg = ExperimentConfig(
+                    output_dir=Path(args.output_dir),
+                    llm=LocalLLMConfig(),
+                    judge_llm=judge_llm_cfg,
+                    **base_kwargs,
+                )
                 boot_graph = build_graph_from_local(bootstrap_cfg)
                 stats = store.persist_graph(boot_graph, clear_existing=args.neo4j_clear)
                 print(
@@ -163,7 +180,7 @@ def main() -> None:
         if multiple_models:
             run_out = run_out / slugify(model_label)
 
-        config = ExperimentConfig(output_dir=run_out, llm=llm_cfg, **base_kwargs)
+        config = ExperimentConfig(output_dir=run_out, llm=llm_cfg, judge_llm=judge_llm_cfg, **base_kwargs)
         pipeline = TripTailorGraphRAGPipeline(config=config, graph_override=graph_override)
 
         if args.export_neo4j and not export_done:
@@ -204,6 +221,8 @@ def main() -> None:
                 "limit": args.limit,
                 "methods": args.methods,
                 "llm_backend": args.llm_backend,
+                "judge_llm_backend": args.judge_llm_backend,
+                "judge_llm_model": args.judge_llm_model,
             },
         }
         summary_path = Path(args.output_dir) / "experiment_summary.json"

@@ -14,13 +14,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from triptailor_graphrag.config import AblationConfig, ExperimentConfig, RetrievalWeights
+from triptailor_graphrag.config import AblationConfig, ExperimentConfig, LocalLLMConfig, RetrievalWeights
 from triptailor_graphrag.data_loader import DataLoader
 from triptailor_graphrag.graph import GraphBuilder
 from triptailor_graphrag.pattern import PatternMiner
 from triptailor_graphrag.pipeline import TripTailorGraphRAGPipeline
 
-LOWER_BETTER_METRICS = {"route_distance_ratio"}
+LOWER_BETTER_METRICS = {"average_route_distance_ratio", "max_single_day_route_km"}
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -88,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         help="Ranking target metric (default: feasibility_pass_rate)",
     )
     parser.add_argument("--graph-source", default="local", choices=["local", "neo4j"])
+    parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
+    parser.add_argument("--judge-llm-model", default=None)
+    parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
+    parser.add_argument("--judge-llm-max-new-tokens", type=int, default=384)
+    parser.add_argument("--judge-llm-timeout-seconds", type=int, default=120)
     parser.add_argument("--neo4j-bootstrap", action="store_true")
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     parser.add_argument("--neo4j-user", default="neo4j")
@@ -171,6 +176,13 @@ def run_one(
     cfg = ExperimentConfig(
         data_dir=Path(args.data_dir),
         output_dir=run_out,
+        judge_llm=LocalLLMConfig(
+            backend=args.judge_llm_backend,
+            model=args.judge_llm_model,
+            temperature=args.judge_llm_temperature,
+            max_new_tokens=args.judge_llm_max_new_tokens,
+            timeout_seconds=args.judge_llm_timeout_seconds,
+        ),
         retrieval_weights=RetrievalWeights(
             vector=combo["w_vector"],
             constraint=combo["w_constraint"],
@@ -209,9 +221,10 @@ def sort_rows(rows: list[dict[str, Any]], target_metric: str) -> list[dict[str, 
         rows,
         key=lambda x: (
             float(x.get(target_metric, 0.0)),
+            float(x.get("constraint_satisfaction_rate", 0.0)),
             float(x.get("feasibility_pass_rate", 0.0)),
             float(x.get("personalization_proxy", 0.0)),
-            -float(x.get("route_distance_ratio", 999999.0)),
+            -float(x.get("average_route_distance_ratio", 999999.0)),
         ),
         reverse=reverse,
     )
@@ -278,7 +291,17 @@ def main() -> None:
                         "Neo4j graph is empty. Run scripts/export_neo4j.py once, "
                         "or pass --neo4j-bootstrap."
                     )
-                base_cfg = ExperimentConfig(data_dir=Path(args.data_dir), output_dir=Path(args.output_dir))
+                base_cfg = ExperimentConfig(
+                    data_dir=Path(args.data_dir),
+                    output_dir=Path(args.output_dir),
+                    judge_llm=LocalLLMConfig(
+                        backend=args.judge_llm_backend,
+                        model=args.judge_llm_model,
+                        temperature=args.judge_llm_temperature,
+                        max_new_tokens=args.judge_llm_max_new_tokens,
+                        timeout_seconds=args.judge_llm_timeout_seconds,
+                    ),
+                )
                 bundle = DataLoader(base_cfg.data_dir).load()
                 miner = PatternMiner()
                 miner.fit(bundle.train_samples)
@@ -298,7 +321,8 @@ def main() -> None:
         print(
             f"  -> feasibility={row.get('feasibility_pass_rate', 0):.4f}, "
             f"personalization={row.get('personalization_proxy', 0):.4f}, "
-            f"route_ratio={row.get('route_distance_ratio', 0):.4f}"
+            f"avg_route_ratio={row.get('average_route_distance_ratio', 0):.4f}, "
+            f"max_day_route={row.get('max_single_day_route_km', 0):.2f}"
         )
 
     ranked = sort_rows(rows, args.target_metric)
