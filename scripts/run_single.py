@@ -11,10 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from triptailor_graphrag.config import ExperimentConfig, LocalLLMConfig
-from triptailor_graphrag.data_loader import DataLoader
-from triptailor_graphrag.graph import GraphBuilder
-from triptailor_graphrag.pattern import PatternMiner
+from triptailor_graphrag.config import ExperimentConfig, GraphStoreConfig, LocalLLMConfig, VectorStoreConfig
 from triptailor_graphrag.pipeline import METHODS, TripTailorGraphRAGPipeline
 
 
@@ -23,6 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--method", default="graphrag_summary", choices=METHODS)
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--train-file", default="train.json", help="Training split filename relative to --data-dir")
+    parser.add_argument("--eval-file", default="test.json", help="Evaluation split filename relative to --data-dir")
+    parser.add_argument("--info-file", default="infomation.json", help="Info filename relative to --data-dir")
     parser.add_argument("--output", default=None)
     parser.add_argument("--llm-backend", default=None, choices=["ollama", "transformers"])
     parser.add_argument("--llm-model", default=None)
@@ -30,13 +30,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--llm-max-new-tokens", type=int, default=768)
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument(
+        "--no-llm-fallback",
+        action="store_true",
+        help="Fail instead of falling back to heuristic planning when local LLM planning errors.",
+    )
     parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
     parser.add_argument("--judge-llm-model", default=None)
     parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
     parser.add_argument("--judge-llm-max-new-tokens", type=int, default=384)
     parser.add_argument("--judge-llm-timeout-seconds", type=int, default=120)
-    parser.add_argument("--graph-source", default="local", choices=["local", "neo4j"])
-    parser.add_argument("--neo4j-bootstrap", action="store_true")
+    parser.add_argument("--vector-backend", default="auto", choices=["auto", "tfidf", "faiss"])
+    parser.add_argument("--vector-cache-dir", default=".cache/faiss")
+    parser.add_argument("--embed-model", default=None)
+    parser.add_argument("--embed-batch-size", type=int, default=32)
+    parser.add_argument("--rebuild-vector-index", action="store_true")
+    parser.add_argument("--graph-source", default="auto", choices=["auto", "local", "neo4j"])
+    parser.add_argument("--neo4j-bootstrap", action="store_true", help="Deprecated: bootstrap is automatic for Neo4j")
+    parser.add_argument("--no-neo4j-bootstrap", action="store_true", help="Disable automatic bootstrap when Neo4j is empty")
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     parser.add_argument("--neo4j-user", default="neo4j")
     parser.add_argument("--neo4j-password", default=None)
@@ -55,6 +66,7 @@ def main() -> None:
         temperature=args.llm_temperature,
         max_new_tokens=args.llm_max_new_tokens,
         timeout_seconds=args.llm_timeout_seconds,
+        fallback_to_heuristic=not args.no_llm_fallback,
     )
     judge_llm_cfg = LocalLLMConfig(
         backend=args.judge_llm_backend,
@@ -63,38 +75,37 @@ def main() -> None:
         max_new_tokens=args.judge_llm_max_new_tokens,
         timeout_seconds=args.judge_llm_timeout_seconds,
     )
-    config = ExperimentConfig(data_dir=Path(args.data_dir), llm=llm_cfg, judge_llm=judge_llm_cfg)
-    graph_override = None
+    default_graph_store = GraphStoreConfig()
+    graph_store_cfg = GraphStoreConfig(
+        source=args.graph_source,
+        neo4j_uri=args.neo4j_uri,
+        neo4j_user=args.neo4j_user,
+        neo4j_password=args.neo4j_password if args.neo4j_password is not None else default_graph_store.neo4j_password,
+        neo4j_database=args.neo4j_database,
+        neo4j_batch_size=args.neo4j_batch_size,
+        bootstrap_if_missing=not args.no_neo4j_bootstrap,
+        clear_on_bootstrap=args.neo4j_clear,
+    )
+    default_vector_store = VectorStoreConfig()
+    vector_store_cfg = VectorStoreConfig(
+        backend=args.vector_backend,
+        cache_dir=Path(args.vector_cache_dir),
+        embed_model=args.embed_model or default_vector_store.embed_model,
+        embed_batch_size=args.embed_batch_size,
+        force_rebuild=args.rebuild_vector_index,
+    )
+    config = ExperimentConfig(
+        data_dir=Path(args.data_dir),
+        train_file=args.train_file,
+        eval_file=args.eval_file,
+        info_file=args.info_file,
+        llm=llm_cfg,
+        judge_llm=judge_llm_cfg,
+        graph_store=graph_store_cfg,
+        vector_store=vector_store_cfg,
+    )
 
-    if args.graph_source == "neo4j":
-        if not args.neo4j_password:
-            raise ValueError("--neo4j-password is required when --graph-source neo4j")
-        from triptailor_graphrag.neo4j_store import Neo4jConnConfig, Neo4jGraphStore
-
-        conn = Neo4jConnConfig(
-            uri=args.neo4j_uri,
-            user=args.neo4j_user,
-            password=args.neo4j_password,
-            database=args.neo4j_database,
-            batch_size=args.neo4j_batch_size,
-        )
-        with Neo4jGraphStore(conn) as store:
-            if store.graph_exists():
-                graph_override = store.load_graph()
-            else:
-                if not args.neo4j_bootstrap:
-                    raise RuntimeError(
-                        "Neo4j graph is empty. Run scripts/export_neo4j.py once, "
-                        "or pass --neo4j-bootstrap."
-                    )
-                bundle = DataLoader(config.data_dir).load()
-                miner = PatternMiner()
-                miner.fit(bundle.train_samples)
-                boot_graph = GraphBuilder(config).build(bundle, miner)
-                store.persist_graph(boot_graph, clear_existing=args.neo4j_clear)
-                graph_override = store.load_graph()
-
-    pipeline = TripTailorGraphRAGPipeline(config=config, graph_override=graph_override)
+    pipeline = TripTailorGraphRAGPipeline(config=config)
     result = pipeline.run_single(pid=args.pid, method=args.method)
     payload = json.dumps(result, ensure_ascii=False, indent=2)
 

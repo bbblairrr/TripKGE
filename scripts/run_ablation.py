@@ -14,10 +14,15 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from triptailor_graphrag.config import AblationConfig, ExperimentConfig, LocalLLMConfig, RetrievalWeights
-from triptailor_graphrag.data_loader import DataLoader
-from triptailor_graphrag.graph import GraphBuilder
-from triptailor_graphrag.pattern import PatternMiner
+from triptailor_graphrag.config import (
+    AblationConfig,
+    ExperimentConfig,
+    GraphStoreConfig,
+    LocalLLMConfig,
+    RetrievalWeights,
+    VectorStoreConfig,
+)
+from triptailor_graphrag.graph_runtime import resolve_graph
 from triptailor_graphrag.pipeline import TripTailorGraphRAGPipeline
 
 LOWER_BETTER_METRICS = {"average_route_distance_ratio", "max_single_day_route_km"}
@@ -64,8 +69,11 @@ def parse_bool_list(value: str) -> list[bool]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ablation studies for TripTailor-GraphRAG.")
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--train-file", default="train.json", help="Training split filename relative to --data-dir")
+    parser.add_argument("--eval-file", default="test.json", help="Evaluation split filename relative to --data-dir")
+    parser.add_argument("--info-file", default="infomation.json", help="Info filename relative to --data-dir")
     parser.add_argument("--output-dir", default="outputs/ablation")
-    parser.add_argument("--limit", type=int, default=100, help="Only evaluate first N test samples")
+    parser.add_argument("--limit", type=int, default=100, help="Only evaluate first N evaluation samples")
     parser.add_argument("--max-runs", type=int, default=None, help="Cap number of combinations")
 
     parser.add_argument("--hops", type=parse_int_list, default=parse_int_list("1,2"))
@@ -87,13 +95,19 @@ def parse_args() -> argparse.Namespace:
         default="feasibility_pass_rate",
         help="Ranking target metric (default: feasibility_pass_rate)",
     )
-    parser.add_argument("--graph-source", default="local", choices=["local", "neo4j"])
+    parser.add_argument("--graph-source", default="auto", choices=["auto", "local", "neo4j"])
     parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
     parser.add_argument("--judge-llm-model", default=None)
     parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
     parser.add_argument("--judge-llm-max-new-tokens", type=int, default=384)
     parser.add_argument("--judge-llm-timeout-seconds", type=int, default=120)
-    parser.add_argument("--neo4j-bootstrap", action="store_true")
+    parser.add_argument("--vector-backend", default="auto", choices=["auto", "tfidf", "faiss"])
+    parser.add_argument("--vector-cache-dir", default=".cache/faiss")
+    parser.add_argument("--embed-model", default=None)
+    parser.add_argument("--embed-batch-size", type=int, default=32)
+    parser.add_argument("--rebuild-vector-index", action="store_true")
+    parser.add_argument("--neo4j-bootstrap", action="store_true", help="Deprecated: bootstrap is automatic for Neo4j")
+    parser.add_argument("--no-neo4j-bootstrap", action="store_true", help="Disable automatic bootstrap when Neo4j is empty")
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     parser.add_argument("--neo4j-user", default="neo4j")
     parser.add_argument("--neo4j-password", default=None)
@@ -175,6 +189,9 @@ def run_one(
 
     cfg = ExperimentConfig(
         data_dir=Path(args.data_dir),
+        train_file=args.train_file,
+        eval_file=args.eval_file,
+        info_file=args.info_file,
         output_dir=run_out,
         judge_llm=LocalLLMConfig(
             backend=args.judge_llm_backend,
@@ -182,6 +199,23 @@ def run_one(
             temperature=args.judge_llm_temperature,
             max_new_tokens=args.judge_llm_max_new_tokens,
             timeout_seconds=args.judge_llm_timeout_seconds,
+        ),
+        graph_store=GraphStoreConfig(
+            source=args.graph_source,
+            neo4j_uri=args.neo4j_uri,
+            neo4j_user=args.neo4j_user,
+            neo4j_password=args.neo4j_password,
+            neo4j_database=args.neo4j_database,
+            neo4j_batch_size=args.neo4j_batch_size,
+            bootstrap_if_missing=not args.no_neo4j_bootstrap,
+            clear_on_bootstrap=args.neo4j_clear,
+        ),
+        vector_store=VectorStoreConfig(
+            backend=args.vector_backend,
+            cache_dir=Path(args.vector_cache_dir),
+            embed_model=args.embed_model or VectorStoreConfig().embed_model,
+            embed_batch_size=args.embed_batch_size,
+            force_rebuild=args.rebuild_vector_index,
         ),
         retrieval_weights=RetrievalWeights(
             vector=combo["w_vector"],
@@ -260,58 +294,56 @@ def write_outputs(rows: list[dict[str, Any]], target_metric: str, output_root: P
 def main() -> None:
     args = parse_args()
     output_root = Path(args.output_dir)
+    default_graph_store = GraphStoreConfig()
+    default_vector_store = VectorStoreConfig()
+    graph_store_cfg = GraphStoreConfig(
+        source=args.graph_source,
+        neo4j_uri=args.neo4j_uri,
+        neo4j_user=args.neo4j_user,
+        neo4j_password=args.neo4j_password if args.neo4j_password is not None else default_graph_store.neo4j_password,
+        neo4j_database=args.neo4j_database,
+        neo4j_batch_size=args.neo4j_batch_size,
+        bootstrap_if_missing=not args.no_neo4j_bootstrap,
+        clear_on_bootstrap=args.neo4j_clear,
+    )
+    vector_store_cfg = VectorStoreConfig(
+        backend=args.vector_backend,
+        cache_dir=Path(args.vector_cache_dir),
+        embed_model=args.embed_model or default_vector_store.embed_model,
+        embed_batch_size=args.embed_batch_size,
+        force_rebuild=args.rebuild_vector_index,
+    )
 
     combos = build_combinations(args)
     print(f"Total ablation combinations: {len(combos)}")
 
-    graph_override = None
-    if args.graph_source == "neo4j":
-        if not args.neo4j_password:
-            raise ValueError("--neo4j-password is required when --graph-source neo4j")
-        from triptailor_graphrag.neo4j_store import Neo4jConnConfig, Neo4jGraphStore
-
-        conn = Neo4jConnConfig(
-            uri=args.neo4j_uri,
-            user=args.neo4j_user,
-            password=args.neo4j_password,
-            database=args.neo4j_database,
-            batch_size=args.neo4j_batch_size,
+    base_cfg = ExperimentConfig(
+        data_dir=Path(args.data_dir),
+        train_file=args.train_file,
+        eval_file=args.eval_file,
+        info_file=args.info_file,
+        output_dir=Path(args.output_dir),
+        judge_llm=LocalLLMConfig(
+            backend=args.judge_llm_backend,
+            model=args.judge_llm_model,
+            temperature=args.judge_llm_temperature,
+            max_new_tokens=args.judge_llm_max_new_tokens,
+            timeout_seconds=args.judge_llm_timeout_seconds,
+        ),
+        graph_store=graph_store_cfg,
+        vector_store=vector_store_cfg,
+    )
+    graph_resolution = resolve_graph(base_cfg)
+    graph_override = graph_resolution
+    if graph_resolution.stats:
+        print(
+            f"Graph ready via {graph_resolution.action}: "
+            f"nodes={graph_resolution.stats['node_count']}, edges={graph_resolution.stats['edge_count']}"
         )
-        with Neo4jGraphStore(conn) as store:
-            if store.graph_exists():
-                stats = store.graph_stats()
-                print(
-                    f"Loaded graph from Neo4j: nodes={stats['node_count']}, "
-                    f"edges={stats['edge_count']}, uri={args.neo4j_uri}, db={args.neo4j_database}"
-                )
-                graph_override = store.load_graph()
-            else:
-                if not args.neo4j_bootstrap:
-                    raise RuntimeError(
-                        "Neo4j graph is empty. Run scripts/export_neo4j.py once, "
-                        "or pass --neo4j-bootstrap."
-                    )
-                base_cfg = ExperimentConfig(
-                    data_dir=Path(args.data_dir),
-                    output_dir=Path(args.output_dir),
-                    judge_llm=LocalLLMConfig(
-                        backend=args.judge_llm_backend,
-                        model=args.judge_llm_model,
-                        temperature=args.judge_llm_temperature,
-                        max_new_tokens=args.judge_llm_max_new_tokens,
-                        timeout_seconds=args.judge_llm_timeout_seconds,
-                    ),
-                )
-                bundle = DataLoader(base_cfg.data_dir).load()
-                miner = PatternMiner()
-                miner.fit(bundle.train_samples)
-                boot_graph = GraphBuilder(base_cfg).build(bundle, miner)
-                stats = store.persist_graph(boot_graph, clear_existing=args.neo4j_clear)
-                print(
-                    f"Bootstrapped Neo4j graph: nodes={stats['node_count']}, "
-                    f"edges={stats['edge_count']}, uri={args.neo4j_uri}, db={args.neo4j_database}"
-                )
-                graph_override = store.load_graph()
+    else:
+        print(f"Graph ready via {graph_resolution.action}")
+    if graph_resolution.details:
+        print(graph_resolution.details)
 
     rows: list[dict[str, Any]] = []
     for idx, combo in enumerate(combos, start=1):

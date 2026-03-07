@@ -45,6 +45,7 @@ wheels/
 # Output directories
 outputs/
 logs/
+.cache/
 
 # Neo4j
 .neo4j/

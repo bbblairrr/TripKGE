@@ -20,6 +20,9 @@ from triptailor_graphrag.pattern import PatternMiner
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export generated knowledge graph to local Neo4j.")
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--train-file", default="train.json", help="Training split filename relative to --data-dir")
+    parser.add_argument("--eval-file", default="test.json", help="Evaluation split filename relative to --data-dir")
+    parser.add_argument("--info-file", default="infomation.json", help="Info filename relative to --data-dir")
 
     parser.add_argument("--uri", default="bolt://localhost:7687")
     parser.add_argument("--user", default="neo4j")
@@ -41,9 +44,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_graph(data_dir: Path):
-    cfg = ExperimentConfig(data_dir=data_dir)
-    bundle = DataLoader(cfg.data_dir).load()
+def build_graph(data_dir: Path, train_file: str, eval_file: str, info_file: str):
+    cfg = ExperimentConfig(data_dir=data_dir, train_file=train_file, eval_file=eval_file, info_file=info_file)
+    bundle = DataLoader(cfg.data_dir, train_file=cfg.train_file, eval_file=cfg.eval_file, info_file=cfg.info_file).load()
     miner = PatternMiner()
     miner.fit(bundle.train_samples)
     graph = GraphBuilder(cfg).build(bundle, miner)
@@ -70,7 +73,7 @@ def main() -> None:
             )
             return
 
-        graph = build_graph(Path(args.data_dir))
+        graph = build_graph(Path(args.data_dir), args.train_file, args.eval_file, args.info_file)
         stats = store.persist_graph(graph, clear_existing=args.clear)
         print(
             f"Neo4j import finished: nodes={stats['node_count']}, "

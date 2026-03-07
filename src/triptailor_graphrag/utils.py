@@ -12,13 +12,13 @@ DURATION_RANGE_PATTERN = re.compile(
 DURATION_SINGLE_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(minutes?|hours?|days?)", re.IGNORECASE)
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]", re.IGNORECASE)
-TIME_RANGE_PATTERN = re.compile(r"(\d{1,2}:\d{2})\s*[\-–—~]\s*(\d{1,2}:\d{2})")
-BUDGET_PATTERN = re.compile(r"budget of [¥$]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+TIME_RANGE_PATTERN = re.compile(r"(\d{1,2}:\d{2})\s*(?:-|to)\s*(\d{1,2}:\d{2})", re.IGNORECASE)
+BUDGET_PATTERN = re.compile(r"budget of [楼$]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 MEAL_RANGE_PATTERN = re.compile(
-    r"meal costs?\s*(?:ranging from)?\s*[¥$]?\s*([0-9]+)\s*(?:to|-)\s*[¥$]?\s*([0-9]+)",
+    r"meal costs?\s*(?:ranging from)?\s*[楼$]?\s*([0-9]+)\s*(?:to|-)\s*[楼$]?\s*([0-9]+)",
     re.IGNORECASE,
 )
-MEAL_OVER_PATTERN = re.compile(r"meal costs?\s*(?:over|above)\s*[¥$]?\s*([0-9]+)", re.IGNORECASE)
+MEAL_OVER_PATTERN = re.compile(r"meal costs?\s*(?:over|above)\s*[楼$]?\s*([0-9]+)", re.IGNORECASE)
 
 HOTEL_CATEGORY_KEYWORDS = {
     "economy": "Economy",
@@ -156,7 +156,20 @@ def parse_time_range(value: str | None) -> tuple[int, int] | None:
     end = parse_time_to_minutes(match.group(2))
     if start is None or end is None:
         return None
+    if end < start:
+        end += 24 * 60
     return start, end
+
+
+def format_minutes_hhmm(total_minutes: int) -> str:
+    minutes = max(0, total_minutes)
+    hh = (minutes // 60) % 24
+    mm = minutes % 60
+    return f"{hh:02d}:{mm:02d}"
+
+
+def format_time_range(start_minutes: int, end_minutes: int) -> str:
+    return f"{format_minutes_hhmm(start_minutes)}-{format_minutes_hhmm(end_minutes)}"
 
 
 def parse_opening_hours(value: str | None) -> tuple[int, int] | None:

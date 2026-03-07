@@ -32,13 +32,22 @@ class DatasetBundle:
 
 
 class DataLoader:
-    def __init__(self, data_dir: Path):
+    def __init__(
+        self,
+        data_dir: Path,
+        train_file: str = "train.json",
+        eval_file: str = "test.json",
+        info_file: str = "infomation.json",
+    ):
         self.data_dir = Path(data_dir)
+        self.train_file = train_file
+        self.eval_file = eval_file
+        self.info_file = info_file
 
     def load(self) -> DatasetBundle:
-        train_samples = self._load_json("train.json")
-        test_samples = self._load_json("test.json")
-        info_by_pid = self._load_json("infomation.json")
+        train_samples = self._load_json(self.train_file)
+        test_samples = self._load_json(self.eval_file)
+        info_by_pid = self._load_json(self.info_file)
 
         query_specs = [self._build_query_spec(item) for item in test_samples]
 

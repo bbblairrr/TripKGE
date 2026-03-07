@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import mean
 from typing import Any
 
@@ -30,6 +30,7 @@ class SampleMetric:
     pid: int
     method: str
     values: dict[str, float]
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 def compute_sample_metrics(
@@ -81,7 +82,7 @@ def compute_sample_metrics(
     opening_hours_compliance = _opening_hours_compliance(plan, candidate_map)
     stay_duration_feasibility = _stay_duration_feasibility(plan, candidate_map)
     transport_time_feasibility = _transport_time_feasibility(query, plan)
-    personalization_proxy = _personalization_proxy(
+    personalization_proxy, personalization_details = _personalization_proxy(
         query=query,
         plan=plan,
         gt=gt,
@@ -110,7 +111,12 @@ def compute_sample_metrics(
     }
     values.update(ranked_metrics)
 
-    return SampleMetric(pid=query.pid, method=method, values=values)
+    return SampleMetric(
+        pid=query.pid,
+        method=method,
+        values=values,
+        details={"personalization": personalization_details},
+    )
 
 
 def aggregate_metrics(rows: list[SampleMetric]) -> dict[str, float]:
@@ -322,15 +328,29 @@ def _personalization_proxy(
     gt: dict[str, Any],
     candidate_map: dict[str, Candidate],
     preference_judge: PreferenceJudge | None = None,
-) -> float:
+) -> tuple[float, dict[str, Any]]:
     if preference_judge is not None:
         judge_result = preference_judge.score(query, plan, gt, candidate_map)
         if judge_result is not None:
-            return judge_result.score
-    return _heuristic_personalization_proxy(query, plan, candidate_map)
+            return judge_result.score, {
+                "mode": "llm_judge",
+                "winner": judge_result.winner,
+                "generated_score": judge_result.generated_score,
+                "reference_score": judge_result.reference_score,
+                "itinerary_a_score": judge_result.itinerary_a_score,
+                "itinerary_b_score": judge_result.itinerary_b_score,
+                "a_is_generated": judge_result.a_is_generated,
+                "rationale": judge_result.rationale,
+            }
+    heuristic_score, heuristic_details = _heuristic_personalization_proxy(query, plan, candidate_map)
+    return heuristic_score, {"mode": "heuristic_fallback", **heuristic_details}
 
 
-def _heuristic_personalization_proxy(query: QuerySpec, plan: PlanResult, candidate_map: dict[str, Candidate]) -> float:
+def _heuristic_personalization_proxy(
+    query: QuerySpec,
+    plan: PlanResult,
+    candidate_map: dict[str, Candidate],
+) -> tuple[float, dict[str, float]]:
     score = 0.0
 
     meal_ok = 1.0
@@ -388,7 +408,14 @@ def _heuristic_personalization_proxy(query: QuerySpec, plan: PlanResult, candida
         intensity_fit = 1.0 if avg_act >= 5 else 0.6
     score += 0.15 * intensity_fit
 
-    return min(1.0, max(0.0, score))
+    final_score = min(1.0, max(0.0, score))
+    return final_score, {
+        "meal_score": meal_ok,
+        "hotel_score": hotel_ok,
+        "interest_coverage_score": interest_cov,
+        "intensity_fit_score": intensity_fit,
+        "score": final_score,
+    }
 
 
 def _answer_relevancy(query: QuerySpec, plan: PlanResult, candidate_map: dict[str, Candidate]) -> float:

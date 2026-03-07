@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 neo4j = ["neo4j>=5.20.0"]
+faiss = ["faiss-cpu>=1.8.0", "numpy>=1.26.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

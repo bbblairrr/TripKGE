@@ -16,6 +16,9 @@ class PreferenceJudgeResult:
     winner: str
     generated_score: float
     reference_score: float
+    itinerary_a_score: float
+    itinerary_b_score: float
+    a_is_generated: bool
     rationale: str = ""
 
 
@@ -61,6 +64,9 @@ class PreferenceJudge:
             winner=winner,
             generated_score=generated_score,
             reference_score=reference_score,
+            itinerary_a_score=itinerary_a_score,
+            itinerary_b_score=itinerary_b_score,
+            a_is_generated=blind_pair["a_is_generated"],
             rationale=rationale,
         )
 

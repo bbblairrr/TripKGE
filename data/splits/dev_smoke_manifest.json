@@ -1,0 +1,32 @@
+{
+  "source_train_file": "train.json",
+  "train_out": "splits\\train_tune_smoke.json",
+  "dev_out": "splits\\dev_smoke.json",
+  "seed": 42,
+  "dev_size": 20,
+  "train_size": 3125,
+  "source_size": 3145,
+  "dev_ratio_effective": 0.006359300476947536,
+  "dev_pids": [
+    430,
+    638,
+    801,
+    862,
+    1047,
+    1252,
+    1268,
+    1365,
+    1399,
+    1474,
+    1624,
+    1821,
+    2007,
+    2111,
+    2114,
+    2187,
+    2261,
+    2885,
+    3000,
+    3078
+  ]
+}

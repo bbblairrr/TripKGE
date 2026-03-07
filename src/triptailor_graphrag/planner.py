@@ -9,7 +9,7 @@ from .config import ExperimentConfig
 from .local_llm import LocalLLMClient, LocalLLMError
 from .pattern import PatternMiner
 from .types import Candidate, EvidenceSummary, PlanResult, QuerySpec
-from .utils import normalize_text
+from .utils import format_time_range, normalize_text, parse_duration_minutes, parse_opening_hours, parse_time_range
 
 
 @dataclass
@@ -45,6 +45,10 @@ class PlanGenerator:
             "19:15-20:30",
             "20:45-22:00",
         ]
+        self.default_day_start = 9 * 60
+        self.default_day_end = 22 * 60
+        self.transport_buffer_minutes = 30
+        self.activity_gap_minutes = 15
 
     def generate(
         self,
@@ -55,15 +59,17 @@ class PlanGenerator:
     ) -> PlanResult:
         cindex = self._build_index(candidate_pool)
         chosen = [cid for cid in summary.chosen_ids if cid in cindex.by_id]
+        planning_error: str | None = None
 
         if self.llm_client is not None:
-            llm_plan = self._generate_with_llm(query, summary, candidate_pool, info, cindex)
+            llm_plan, planning_error = self._generate_with_llm(query, summary, candidate_pool, info, cindex)
             if llm_plan is not None:
                 return llm_plan
 
         hotel_entry = self._pick_hotel(query, chosen, cindex)
         transportation = self._pick_transport(query, info)
-        itinerary = self._build_itinerary(query, chosen, cindex, summary.day_suggestions)
+        itinerary = self._build_itinerary(query, chosen, cindex, summary.day_suggestions, transportation)
+        itinerary = self._schedule_itinerary(query, itinerary, transportation, cindex, chosen)
 
         return PlanResult(
             query_pid=query.pid,
@@ -73,6 +79,8 @@ class PlanGenerator:
             candidate_pool=[c.candidate_id for c in candidate_pool],
             evidence_ids=summary.chosen_ids,
             validator_report={},
+            planner_mode="heuristic_fallback" if self.llm_client is not None else "heuristic",
+            planning_error=planning_error,
         )
 
     def _generate_with_llm(
@@ -82,14 +90,15 @@ class PlanGenerator:
         candidate_pool: list[Candidate],
         info: dict[str, Any],
         cindex: CandidateIndex,
-    ) -> PlanResult | None:
+    ) -> tuple[PlanResult | None, str | None]:
         try:
-            prompt = self._build_llm_prompt(query, summary, candidate_pool, cindex)
+            transportation = self._pick_transport(query, info)
+            prompt = self._build_llm_prompt(query, summary, candidate_pool, cindex, transportation)
             response = self.llm_client.generate(prompt, system_prompt=self._llm_system_prompt())
             payload = self._parse_llm_json(response)
             hotel_entry = self._llm_pick_hotel(payload, query, summary, cindex)
-            transportation = self._pick_transport(query, info)
-            itinerary = self._llm_build_itinerary(payload, query, summary, cindex)
+            itinerary = self._llm_build_itinerary(payload, query, summary, cindex, transportation)
+            itinerary = self._schedule_itinerary(query, itinerary, transportation, cindex, summary.chosen_ids)
             return PlanResult(
                 query_pid=query.pid,
                 hotel=hotel_entry,
@@ -98,11 +107,13 @@ class PlanGenerator:
                 candidate_pool=[c.candidate_id for c in candidate_pool],
                 evidence_ids=summary.chosen_ids,
                 validator_report={},
-            )
-        except (LocalLLMError, ValueError, KeyError, json.JSONDecodeError):
+                planner_mode="llm",
+                planning_error=None,
+            ), None
+        except (LocalLLMError, ValueError, KeyError, json.JSONDecodeError) as exc:
             if not self.config.llm.fallback_to_heuristic:
                 raise
-            return None
+            return None, str(exc)
 
     def _build_index(self, candidate_pool: list[Candidate]) -> CandidateIndex:
         by_id = {c.candidate_id: c for c in candidate_pool}
@@ -192,6 +203,7 @@ class PlanGenerator:
         chosen_ids: list[str],
         cindex: CandidateIndex,
         day_suggestions: dict[int, list[str]],
+        transportation: list[dict[str, Any]],
     ) -> dict[str, list[dict[str, Any]]]:
         pattern = self.pattern_miner.get_pattern(query.day)
 
@@ -222,9 +234,13 @@ class PlanGenerator:
             activities: list[dict[str, Any]] = []
             day_used: set[str] = set()
             day_pref_ids = day_suggestions.get(day_idx, [])
+            max_items = self._max_items_for_day(query, day_idx, transportation)
+            if max_items <= 0:
+                itinerary[day_key] = []
+                continue
 
             day_tokens = pattern.signature[day_idx - 1] if day_idx - 1 < len(pattern.signature) else ()
-            for token in day_tokens:
+            for token in day_tokens[:max_items]:
                 slot, action = token.split(":", 1) if ":" in token else ("afternoon", "sightseeing")
                 if action == "sightseeing":
                     blocked = used_ids.union(day_used)
@@ -257,10 +273,16 @@ class PlanGenerator:
                     continue
 
             if not activities:
-                fallback = self._fallback_day(query, day_idx, chosen_attractions, chosen_restaurants, used_ids)
+                fallback = self._fallback_day(
+                    query,
+                    day_idx,
+                    chosen_attractions,
+                    chosen_restaurants,
+                    used_ids,
+                    max_items=max_items,
+                )
                 activities.extend(fallback)
 
-            self._normalize_day_times(activities)
             itinerary[day_key] = activities
 
         return itinerary
@@ -271,6 +293,7 @@ class PlanGenerator:
         query: QuerySpec,
         summary: EvidenceSummary,
         cindex: CandidateIndex,
+        transportation: list[dict[str, Any]],
     ) -> dict[str, list[dict[str, Any]]]:
         days_payload = payload.get("days", {})
         if not isinstance(days_payload, dict):
@@ -294,8 +317,12 @@ class PlanGenerator:
             raw_items = days_payload.get(str(day_idx), [])
             activities: list[dict[str, Any]] = []
             day_used: set[str] = set()
+            max_items = self._max_items_for_day(query, day_idx, transportation)
+            if max_items <= 0:
+                itinerary[f"day_{day_idx}"] = []
+                continue
             if isinstance(raw_items, list):
-                for item in raw_items:
+                for item in raw_items[:max_items]:
                     if not isinstance(item, dict):
                         continue
                     action = str(item.get("action") or "").strip().lower()
@@ -311,8 +338,14 @@ class PlanGenerator:
                     used_ids.add(cand.candidate_id)
 
             if not activities:
-                activities = self._fallback_day(query, day_idx, chosen_attractions, chosen_restaurants, used_ids)
-            self._normalize_day_times(activities)
+                activities = self._fallback_day(
+                    query,
+                    day_idx,
+                    chosen_attractions,
+                    chosen_restaurants,
+                    used_ids,
+                    max_items=max_items,
+                )
             itinerary[f"day_{day_idx}"] = activities
         return itinerary
 
@@ -332,17 +365,20 @@ class PlanGenerator:
         attractions: list[Candidate],
         restaurants: list[Candidate],
         used_ids: set[str],
+        max_items: int = 3,
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        if attractions:
+        if max_items <= 0:
+            return out
+        if attractions and len(out) < max_items:
             a = self._next_unused(attractions, used_ids) or attractions[(day_idx - 1) % len(attractions)]
             out.append(self._activity_dict("morning", "sightseeing", a))
             used_ids.add(a.candidate_id)
-        if restaurants:
+        if restaurants and len(out) < max_items:
             r = self._next_unused(restaurants, used_ids) or restaurants[(day_idx - 1) % len(restaurants)]
             out.append(self._activity_dict("noon", "dining", r))
             used_ids.add(r.candidate_id)
-        if attractions:
+        if attractions and len(out) < max_items:
             a2 = self._next_unused(attractions, used_ids) or attractions[(day_idx) % len(attractions)]
             out.append(self._activity_dict("afternoon", "sightseeing", a2))
             used_ids.add(a2.candidate_id)
@@ -361,6 +397,215 @@ class PlanGenerator:
         for idx, act in enumerate(activities):
             if idx < len(self.day_time_sequence):
                 act["time"] = self.day_time_sequence[idx]
+
+    def _schedule_itinerary(
+        self,
+        query: QuerySpec,
+        itinerary: dict[str, list[dict[str, Any]]],
+        transportation: list[dict[str, Any]],
+        cindex: CandidateIndex,
+        preferred_ids: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        scheduled: dict[str, list[dict[str, Any]]] = {}
+        used_trip: set[str] = set()
+        preferred_attractions = [
+            cindex.by_id[cid]
+            for cid in preferred_ids
+            if cid in cindex.by_id and cindex.by_id[cid].entity_type == "attraction"
+        ]
+        preferred_restaurants = [
+            cindex.by_id[cid]
+            for cid in preferred_ids
+            if cid in cindex.by_id and cindex.by_id[cid].entity_type == "restaurant"
+        ]
+
+        for day_idx in range(1, query.day + 1):
+            day_key = f"day_{day_idx}"
+            raw_items = itinerary.get(day_key, [])
+            max_items = self._max_items_for_day(query, day_idx, transportation)
+            day_items = self._schedule_day_items(
+                query=query,
+                day_idx=day_idx,
+                items=raw_items[:max_items] if max_items > 0 else [],
+                transportation=transportation,
+                cindex=cindex,
+                used_trip=used_trip,
+            )
+            if not day_items and max_items > 0:
+                fallback = self._fallback_day(
+                    query=query,
+                    day_idx=day_idx,
+                    attractions=preferred_attractions or cindex.by_type.get("attraction", []),
+                    restaurants=preferred_restaurants or cindex.by_type.get("restaurant", []),
+                    used_ids=set(used_trip),
+                    max_items=max_items,
+                )
+                day_items = self._schedule_day_items(
+                    query=query,
+                    day_idx=day_idx,
+                    items=fallback,
+                    transportation=transportation,
+                    cindex=cindex,
+                    used_trip=used_trip,
+                )
+            scheduled[day_key] = day_items
+            used_trip.update(
+                act.get("candidate_id")
+                for act in day_items
+                if isinstance(act, dict) and act.get("candidate_id")
+            )
+        return scheduled
+
+    def _schedule_day_items(
+        self,
+        query: QuerySpec,
+        day_idx: int,
+        items: list[dict[str, Any]],
+        transportation: list[dict[str, Any]],
+        cindex: CandidateIndex,
+        used_trip: set[str],
+    ) -> list[dict[str, Any]]:
+        day_start, day_end = self._day_time_bounds(query, day_idx, transportation)
+        if day_end - day_start < 45:
+            return []
+
+        current = day_start
+        day_used: set[str] = set()
+        scheduled: list[dict[str, Any]] = []
+        for act in items:
+            cid = act.get("candidate_id")
+            if not cid or cid in day_used or cid in used_trip:
+                continue
+            candidate = cindex.by_id.get(cid)
+            if candidate is None:
+                continue
+            interval = self._candidate_interval(candidate, str(act.get("action") or ""), current, day_end)
+            if interval is None:
+                continue
+            start_min, end_min = interval
+            scheduled.append(
+                {
+                    "time": format_time_range(start_min, end_min),
+                    "location": candidate.name,
+                    "price": round(candidate.price, 2),
+                    "action": act.get("action"),
+                    "candidate_id": candidate.candidate_id,
+                }
+            )
+            current = min(day_end, end_min + self.activity_gap_minutes)
+            day_used.add(candidate.candidate_id)
+        return scheduled
+
+    def _day_time_bounds(
+        self,
+        query: QuerySpec,
+        day_idx: int,
+        transportation: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        start = self.default_day_start
+        end = self.default_day_end
+        outbound = self._transport_for_direction(query, transportation, "outbound")
+        inbound = self._transport_for_direction(query, transportation, "inbound")
+
+        if day_idx == 1 and outbound is not None:
+            interval = parse_time_range(str(outbound.get("time") or ""))
+            if interval is not None:
+                start = max(start, interval[1] + self.transport_buffer_minutes)
+        if day_idx == query.day and inbound is not None:
+            interval = parse_time_range(str(inbound.get("time") or ""))
+            if interval is not None:
+                end = min(end, interval[0] - self.transport_buffer_minutes)
+        return start, max(start, end)
+
+    def _max_items_for_day(
+        self,
+        query: QuerySpec,
+        day_idx: int,
+        transportation: list[dict[str, Any]],
+    ) -> int:
+        start, end = self._day_time_bounds(query, day_idx, transportation)
+        available = max(0, end - start)
+        if available < 60:
+            return 0
+        estimate = max(1, min(5, available // 105))
+        if query.day > 1 and day_idx in {1, query.day}:
+            estimate = min(estimate, 3)
+        return int(estimate)
+
+    def _transport_for_direction(
+        self,
+        query: QuerySpec,
+        transportation: list[dict[str, Any]],
+        direction: str,
+    ) -> dict[str, Any] | None:
+        outbound_route = normalize_text(f"{query.departure_city} to {query.destination_city}")
+        inbound_route = normalize_text(f"{query.destination_city} to {query.departure_city}")
+        for transport in transportation:
+            route = normalize_text(str(transport.get("route") or ""))
+            if direction == "outbound" and route == outbound_route:
+                return transport
+            if direction == "inbound" and route == inbound_route:
+                return transport
+        return None
+
+    def _transport_constraint_lines(
+        self,
+        query: QuerySpec,
+        transportation: list[dict[str, Any]],
+    ) -> list[str]:
+        lines: list[str] = []
+        outbound = self._transport_for_direction(query, transportation, "outbound")
+        inbound = self._transport_for_direction(query, transportation, "inbound")
+        if outbound is not None:
+            interval = parse_time_range(str(outbound.get("time") or ""))
+            if interval is not None:
+                lines.append(
+                    f"day_1 earliest activity start >= {format_time_range(interval[1] + self.transport_buffer_minutes, interval[1] + self.transport_buffer_minutes)}"
+                )
+        if inbound is not None:
+            interval = parse_time_range(str(inbound.get("time") or ""))
+            if interval is not None:
+                lines.append(
+                    f"day_{query.day} latest activity end <= {format_time_range(interval[0] - self.transport_buffer_minutes, interval[0] - self.transport_buffer_minutes)}"
+                )
+        for day_idx in range(1, query.day + 1):
+            start, end = self._day_time_bounds(query, day_idx, transportation)
+            if end - start < 45:
+                lines.append(f"day_{day_idx} has almost no sightseeing window because of transport; keep it empty or at most one short meal")
+                continue
+            lines.append(
+                f"day_{day_idx} usable window is {format_time_range(start, end)} and should fit no more than {self._max_items_for_day(query, day_idx, transportation)} activities"
+            )
+        return lines
+
+    def _candidate_interval(
+        self,
+        candidate: Candidate,
+        action: str,
+        earliest_start: int,
+        latest_end: int,
+    ) -> tuple[int, int] | None:
+        duration = self._candidate_duration_minutes(candidate, action)
+        start = earliest_start
+        if action == "sightseeing":
+            opening = parse_opening_hours(str(candidate.meta.get("opening_hours") if isinstance(candidate.meta, dict) else ""))
+            if opening is not None:
+                start = max(start, opening[0])
+                if start + duration > opening[1]:
+                    return None
+        end = start + duration
+        if end > latest_end:
+            return None
+        return start, end
+
+    def _candidate_duration_minutes(self, candidate: Candidate, action: str) -> int:
+        if action == "dining":
+            return 60
+        if isinstance(candidate.meta, dict):
+            duration = parse_duration_minutes(str(candidate.meta.get("recommended_duration") or ""))
+            if duration is not None:
+                return max(30, min(duration, 8 * 60))
+        return 90
 
     def _pick_day_preferred(
         self,
@@ -389,6 +634,7 @@ class PlanGenerator:
         summary: EvidenceSummary,
         candidate_pool: list[Candidate],
         cindex: CandidateIndex,
+        transportation: list[dict[str, Any]],
     ) -> str:
         preferred_ids = [cid for cid in summary.chosen_ids if cid in cindex.by_id]
         if not preferred_ids:
@@ -399,9 +645,18 @@ class PlanGenerator:
         for cid in preferred_ids:
             cand = cindex.by_id[cid]
             tag_str = ", ".join(cand.tags[:4]) if cand.tags else "none"
+            extra: list[str] = []
+            if cand.entity_type == "attraction" and isinstance(cand.meta, dict):
+                opening = str(cand.meta.get("opening_hours") or "").strip()
+                duration = str(cand.meta.get("recommended_duration") or "").strip()
+                if opening:
+                    extra.append(f"opening={opening}")
+                if duration:
+                    extra.append(f"recommended_duration={duration}")
+            extra_str = "; " + "; ".join(extra) if extra else ""
             candidate_lines.append(
                 f"- id={cand.candidate_id}; type={cand.entity_type}; name={cand.name}; "
-                f"price={cand.price:.2f}; tags={tag_str}; text={cand.text}"
+                f"price={cand.price:.2f}; tags={tag_str}{extra_str}; text={cand.text}"
             )
 
         constraints = [
@@ -414,7 +669,23 @@ class PlanGenerator:
             f"intensity_pref={query.intensity_pref or 'none'}",
             f"interest_tags={query.interest_tags or []}",
             f"budget_risk_hint={summary.budget_risk}",
+            "keep each day geographically compact and prefer nearby attractions/restaurants together",
+            "day 1 and the last day must respect the exact transport arrival/departure windows below",
+            "ensure each attraction gets at least its recommended duration when provided",
+            "do not schedule a sightseeing activity outside the attraction opening hours when they are known",
+            "avoid repeating the same restaurant or attraction unless the shortlist is exhausted",
         ]
+        transport_lines = self._transport_constraint_lines(query, transportation)
+        suggestion_lines: list[str] = []
+        for day, ids in summary.day_suggestions.items():
+            named = []
+            for cid in ids:
+                cand = cindex.by_id.get(cid)
+                if cand is None:
+                    continue
+                named.append(f"{cid}:{cand.name}")
+            if named:
+                suggestion_lines.append(f"day_{day} -> {', '.join(named)}")
         output_schema = {
             "hotel_candidate_id": "one hotel candidate id",
             "days": {
@@ -429,6 +700,16 @@ class PlanGenerator:
             "Respect budget and preferences.\n\n"
             "Query constraints:\n"
             + "\n".join(f"- {line}" for line in constraints)
+            + (
+                "\n\nTransport windows:\n" + "\n".join(f"- {line}" for line in transport_lines)
+                if transport_lines
+                else ""
+            )
+            + (
+                "\n\nSuggested day clusters:\n" + "\n".join(f"- {line}" for line in suggestion_lines)
+                if suggestion_lines
+                else ""
+            )
             + "\n\nCandidate shortlist:\n"
             + "\n".join(candidate_lines)
             + "\n\nReturn JSON with this schema:\n"

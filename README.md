@@ -168,7 +168,46 @@ scripts/
   run_experiments.py
   run_single.py
   run_ablation.py
+  create_dev_split.py
   export_neo4j.py
+```
+
+## Dev Split Workflow
+
+Use a separate dev split for tuning, but create it from the evaluation set that is already aligned with `infomation.json`.
+
+Create a deterministic `dev_eval/test_final` split from `test.json`:
+
+```powershell
+python scripts\create_dev_split.py `
+  --data-dir data `
+  --seed 42 `
+  --dev-ratio 0.2 `
+  --source-eval-file test.json `
+  --dev-out splits\dev_eval.json `
+  --test-out splits\test_final.json
+```
+
+Tune on `dev_eval.json`:
+
+```powershell
+python scripts\run_experiments.py `
+  --data-dir data `
+  --eval-file splits\dev_eval.json `
+  --methods naive_rag kg_only graphrag_no_summary graphrag_summary `
+  --vector-backend faiss `
+  --output-dir outputs\dev_baselines
+```
+
+After the pipeline is frozen, run the final experiment on `test_final.json`:
+
+```powershell
+python scripts\run_experiments.py `
+  --data-dir data `
+  --eval-file splits\test_final.json `
+  --methods naive_rag kg_only graphrag_no_summary graphrag_summary `
+  --vector-backend faiss `
+  --output-dir outputs\test_baselines
 ```
 ## Local LLM Usage
 
@@ -176,6 +215,12 @@ Install local inference dependencies:
 
 ```bash
 python3 -m pip install -r requirements-local-llm.txt
+```
+
+Install FAISS retrieval dependencies only:
+
+```bash
+python3 -m pip install -e .[faiss]
 ```
 
 Run one sample with a local model:
@@ -208,6 +253,64 @@ Notes:
 - Without LLM arguments, the project keeps using the existing heuristic planner.
 - Multi-model comparison writes each run into `outputs/model_compare/<model_name>/`.
 
+## FAISS Retrieval
+
+The retriever now supports both lexical TF-IDF and dense FAISS backends.
+
+- `vector-backend=auto` is the default. The project tries FAISS first and falls back to TF-IDF if FAISS or the local embedding model is unavailable.
+- `vector-backend=faiss` requires a local embedding model and persists the vector index under `.cache/faiss/` by default.
+- `vector-backend=tfidf` keeps the previous lexical retrieval behavior.
+- The FAISS path is now city-aware and reranks shortlist candidates with a diversity-aware second stage before summary generation.
+- Budget, meal range, hotel preference, opening-hours metadata, and route-anchor proximity are injected earlier into retrieval scoring instead of waiting for validator-only feedback.
+
+Example commands:
+
+```powershell
+python scripts\run_single.py --pid 1 --method graphrag_summary --vector-backend faiss
+python scripts\run_experiments.py --methods graphrag_summary --limit 20 --vector-backend faiss
+```
+
+Optional knobs:
+
+- `--vector-cache-dir`: choose where the FAISS index files are stored.
+- `--embed-model`: override the local embedding model used for dense retrieval.
+- `--embed-batch-size`: control embedding throughput during index build.
+- `--rebuild-vector-index`: force rebuilding the FAISS cache instead of reusing it.
+
+## Neo4j Graph Reuse
+
+The project now supports a Neo4j-first graph lifecycle:
+
+- `graph-source=auto` is the default in the run scripts.
+- If Neo4j credentials are configured, the project will:
+  1. check whether the KG already exists in Neo4j
+  2. build the KG once if missing
+  3. persist it to Neo4j
+  4. reuse the stored graph in later runs
+- If Neo4j is not configured, the project falls back to local graph building.
+
+Recommended setup:
+
+```powershell
+$env:TRIPTAILOR_NEO4J_URI="bolt://localhost:7687"
+$env:TRIPTAILOR_NEO4J_USER="neo4j"
+$env:TRIPTAILOR_NEO4J_PASSWORD="your_password"
+$env:TRIPTAILOR_NEO4J_DATABASE="neo4j"
+```
+
+After that, regular runs will automatically reuse the stored KG:
+
+```powershell
+python scripts\run_single.py --pid 1 --method graphrag_summary
+python scripts\run_experiments.py --methods graphrag_summary --limit 20
+```
+
+If you want to force local graph building for a run:
+
+```powershell
+python scripts\run_single.py --pid 1 --method graphrag_summary --graph-source local
+```
+
 ## Metric Notes
 
 - `feasibility_pass_rate`: hallucination-based feasibility. A plan is infeasible if transport details do not match sandbox options or POIs/hotels cannot be grounded to sandbox candidates.
@@ -223,3 +326,15 @@ Notes:
 - `max_single_day_route_km`: the longest single-day route distance in the generated plan.
 - Retrieval metrics now include `recall_at_5`, `recall_at_10`, `ndcg_at_5`, and `ndcg_at_10`.
 - `answer_relevancy` uses local embedding cosine similarity by default, with lexical fallback if the local embedding model is unavailable.
+- Retrieval itself can run on either `TF-IDF` or `FAISS`, depending on `--vector-backend`.
+
+## Output Diagnostics
+
+Per-sample outputs in `run_single` and `<method>_predictions.jsonl` now include:
+
+- `metric_details`: metric-side breakdowns such as heuristic or LLM-judge personalization details.
+- `diagnostics.retrieval.trace`: candidate counts, city scope, relaxed-filter notes, and seed counts.
+- `diagnostics.retrieval.top_candidates`: top retrieved candidates with raw scores, normalized scores, rerank score, diversity penalty, and constraint notes.
+- `diagnostics.retrieval.summary`: chosen shortlist ids, day suggestions, budget risk, and path evidence.
+- `diagnostics.validator_failure_reasons` and `diagnostics.validator_checks`.
+- `diagnostics.judge`: blind A/B judge details when a judge model is configured, or heuristic fallback details otherwise.
