@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,15 +79,27 @@ class Neo4jGraphStore:
                     rows=batch,
                 )
 
-            for batch in self._batched(rel_rows, self.conn.batch_size):
-                session.run(
-                    "UNWIND $rows AS row "
-                    "MATCH (a:KGNode {node_id: row.src}) "
-                    "MATCH (b:KGNode {node_id: row.dst}) "
-                    "MERGE (a)-[r:KG_REL {src: row.src, dst: row.dst, relation: row.relation}]->(b) "
-                    "SET r += row.props",
-                    rows=batch,
-                )
+            for label, typed_rows in self._group_node_rows_by_label(node_rows).items():
+                quoted_label = self._quote_identifier(label)
+                for batch in self._batched(typed_rows, self.conn.batch_size):
+                    session.run(
+                        "UNWIND $rows AS row "
+                        "MATCH (n:KGNode {node_id: row.node_id}) "
+                        f"SET n:{quoted_label}",
+                        rows=batch,
+                    )
+
+            for rel_type, typed_rows in self._group_edge_rows_by_type(rel_rows).items():
+                quoted_rel_type = self._quote_identifier(rel_type)
+                for batch in self._batched(typed_rows, self.conn.batch_size):
+                    session.run(
+                        "UNWIND $rows AS row "
+                        "MATCH (a:KGNode {node_id: row.src}) "
+                        "MATCH (b:KGNode {node_id: row.dst}) "
+                        f"MERGE (a)-[r:{quoted_rel_type} {{src: row.src, dst: row.dst}}]->(b) "
+                        "SET r += row.props",
+                        rows=batch,
+                    )
 
         return {"node_count": len(node_rows), "edge_count": len(rel_rows)}
 
@@ -97,7 +110,7 @@ class Neo4jGraphStore:
 
         with self._driver.session(database=self.conn.database) as session:
             node_count = session.run("MATCH (n:KGNode) RETURN count(n) AS c").single()["c"]
-            rel_count = session.run("MATCH (:KGNode)-[r:KG_REL]->(:KGNode) RETURN count(r) AS c").single()["c"]
+            rel_count = session.run("MATCH (:KGNode)-[r]->(:KGNode) RETURN count(r) AS c").single()["c"]
         return {"node_count": int(node_count), "edge_count": int(rel_count)}
 
     def graph_exists(self) -> bool:
@@ -114,7 +127,7 @@ class Neo4jGraphStore:
             node_rows = session.run(
                 "MATCH (n:KGNode) "
                 "RETURN n.node_id AS node_id, n.layer AS layer, n.node_type AS node_type, "
-                "n.label AS label, n.meta AS meta"
+                "n.label AS label, n.meta_json AS meta_json, n.meta AS meta_legacy"
             )
             for row in node_rows:
                 node_id = row.get("node_id")
@@ -125,12 +138,12 @@ class Neo4jGraphStore:
                     layer=int(row.get("layer") or 0),
                     node_type=str(row.get("node_type") or "unknown"),
                     label=str(row.get("label") or node_id),
-                    meta=self._sanitize_value(row.get("meta") or {}),
+                    meta=self._deserialize_meta(row.get("meta_json"), row.get("meta_legacy")),
                 )
 
             rel_rows = session.run(
-                "MATCH (a:KGNode)-[r:KG_REL]->(b:KGNode) "
-                "RETURN a.node_id AS src, b.node_id AS dst, r.relation AS relation"
+                "MATCH (a:KGNode)-[r]->(b:KGNode) "
+                "RETURN a.node_id AS src, b.node_id AS dst, coalesce(r.relation, toLower(type(r))) AS relation"
             )
             for row in rel_rows:
                 src = row.get("src")
@@ -159,22 +172,28 @@ class Neo4jGraphStore:
 
         for row in node_rows:
             props = self._to_cypher_map({"node_id": row["node_id"], **row["props"]})
-            lines.append(f"MERGE (n:KGNode {{node_id: {self._quote(row['node_id'])}}}) SET n += {props};")
+            node_label = self._quote_identifier(self._node_label(str(row["props"].get("node_type") or "")))
+            lines.append(
+                f"MERGE (n:KGNode {{node_id: {self._quote(row['node_id'])}}}) "
+                f"SET n += {props} "
+                f"SET n:{node_label};"
+            )
 
         for row in rel_rows:
             props = self._to_cypher_map(row["props"])
+            rel_type = self._quote_identifier(self._relation_type(row["relation"]))
             lines.append(
                 "MATCH (a:KGNode {node_id: "
                 + self._quote(row["src"])
                 + "}), (b:KGNode {node_id: "
                 + self._quote(row["dst"])
                 + "}) "
-                + "MERGE (a)-[r:KG_REL {src: "
+                + "MERGE (a)-[r:"
+                + rel_type
+                + " {src: "
                 + self._quote(row["src"])
                 + ", dst: "
                 + self._quote(row["dst"])
-                + ", relation: "
-                + self._quote(row["relation"])
                 + "}]->(b) SET r += "
                 + props
                 + ";"
@@ -190,7 +209,7 @@ class Neo4jGraphStore:
                 "layer": node.layer,
                 "node_type": node.node_type,
                 "label": node.label,
-                "meta": self._sanitize_value(node.meta),
+                "meta_json": self._serialize_meta(node.meta),
             }
             rows.append({"node_id": node.node_id, "props": props})
         return rows
@@ -247,3 +266,66 @@ class Neo4jGraphStore:
         for key, val in payload.items():
             parts.append(f"{key}: {self._quote(val)}")
         return "{" + ", ".join(parts) + "}"
+
+    def _serialize_meta(self, meta: dict[str, Any]) -> str:
+        return json.dumps(self._sanitize_value(meta), ensure_ascii=False)
+
+    def _deserialize_meta(self, payload: Any, legacy: Any = None) -> dict[str, Any]:
+        if isinstance(payload, str):
+            try:
+                value = json.loads(payload)
+            except json.JSONDecodeError:
+                return {}
+            return value if isinstance(value, dict) else {}
+        if isinstance(legacy, dict):
+            return self._sanitize_value(legacy)
+        return {}
+
+    def _group_edge_rows_by_type(self, rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            rel_type = self._relation_type(str(row.get("relation") or "related"))
+            grouped.setdefault(rel_type, []).append(row)
+        return grouped
+
+    def _group_node_rows_by_label(self, rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            props = row.get("props") or {}
+            node_label = self._node_label(str(props.get("node_type") or "unknown"))
+            grouped.setdefault(node_label, []).append(row)
+        return grouped
+
+    def _node_label(self, node_type: str) -> str:
+        aliases = {
+            "city": "City",
+            "transport": "Transport",
+            "attraction": "Attraction",
+            "restaurant": "Restaurant",
+            "hotel": "Hotel",
+            "etype": "EntityType",
+            "preference": "Preference",
+            "pattern": "Pattern",
+            "pattern_slot": "PatternSlot",
+        }
+        if node_type in aliases:
+            return aliases[node_type]
+        chunks = re.split(r"[^0-9A-Za-z]+", node_type.strip())
+        label = "".join(chunk[:1].upper() + chunk[1:] for chunk in chunks if chunk)
+        if not label:
+            return "Unknown"
+        if not label[0].isalpha():
+            return f"Node{label}"
+        return label
+
+    def _relation_type(self, relation: str) -> str:
+        sanitized = re.sub(r"[^0-9A-Za-z_]+", "_", relation.strip())
+        sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+        if not sanitized:
+            sanitized = "RELATED"
+        if not sanitized[0].isalpha():
+            sanitized = f"REL_{sanitized}"
+        return sanitized.upper()
+
+    def _quote_identifier(self, value: str) -> str:
+        return "`" + value.replace("`", "``") + "`"

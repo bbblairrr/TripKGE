@@ -14,6 +14,7 @@ class LocalLLMConfig:
     max_new_tokens: int = 768
     timeout_seconds: int = 120
     fallback_to_heuristic: bool = True
+    generation_retries: int = 3
 
 
 @dataclass(frozen=True)

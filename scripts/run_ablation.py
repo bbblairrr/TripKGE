@@ -96,6 +96,20 @@ def parse_args() -> argparse.Namespace:
         help="Ranking target metric (default: feasibility_pass_rate)",
     )
     parser.add_argument("--graph-source", default="auto", choices=["auto", "local", "neo4j"])
+    parser.add_argument("--llm-backend", default=None, choices=["ollama", "transformers"])
+    parser.add_argument("--llm-model", default=None, help="Local planning model used during ablation runs")
+    parser.add_argument("--llm-max-candidates", type=int, default=24)
+    parser.add_argument("--llm-temperature", type=float, default=0.0)
+    parser.add_argument("--llm-max-new-tokens", type=int, default=768)
+    parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument("--llm-generation-retries", type=int, default=3)
+    parser.add_argument(
+        "--no-llm-fallback",
+        action="store_true",
+        help="Fail instead of falling back to heuristic planning when local LLM planning errors.",
+    )
+    parser.add_argument("--show-progress", action="store_true", help="Print per-sample progress inside each ablation run")
+    parser.add_argument("--progress-every", type=int, default=10, help="Print progress every N samples in each ablation run")
     parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
     parser.add_argument("--judge-llm-model", default=None)
     parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
@@ -193,6 +207,16 @@ def run_one(
         eval_file=args.eval_file,
         info_file=args.info_file,
         output_dir=run_out,
+        llm=LocalLLMConfig(
+            backend=args.llm_backend,
+            model=args.llm_model,
+            max_candidates=args.llm_max_candidates,
+            temperature=args.llm_temperature,
+            max_new_tokens=args.llm_max_new_tokens,
+            timeout_seconds=args.llm_timeout_seconds,
+            fallback_to_heuristic=not args.no_llm_fallback,
+            generation_retries=args.llm_generation_retries,
+        ),
         judge_llm=LocalLLMConfig(
             backend=args.judge_llm_backend,
             model=args.judge_llm_model,
@@ -234,13 +258,21 @@ def run_one(
     )
 
     pipeline = TripTailorGraphRAGPipeline(config=cfg, graph_override=graph_override)
-    summary = pipeline.run_experiments(methods=["graphrag_summary"], limit=args.limit)
+    summary = pipeline.run_experiments(
+        methods=["graphrag_summary"],
+        limit=args.limit,
+        show_progress=args.show_progress,
+        progress_every=args.progress_every,
+    )
     agg = summary["methods"]["graphrag_summary"]["aggregated"]
 
     row = {
         "run_id": run_id,
         "run_index": run_idx,
         "run_total": total,
+        "llm_backend": args.llm_backend,
+        "llm_model": args.llm_model,
+        "llm_fallback_to_heuristic": not args.no_llm_fallback,
         **combo,
         **agg,
         "n": summary["methods"]["graphrag_summary"]["n"],
@@ -293,6 +325,8 @@ def write_outputs(rows: list[dict[str, Any]], target_metric: str, output_root: P
 
 def main() -> None:
     args = parse_args()
+    if args.llm_model and not args.llm_backend:
+        raise ValueError("--llm-backend is required when --llm-model is used")
     output_root = Path(args.output_dir)
     default_graph_store = GraphStoreConfig()
     default_vector_store = VectorStoreConfig()
@@ -323,6 +357,16 @@ def main() -> None:
         eval_file=args.eval_file,
         info_file=args.info_file,
         output_dir=Path(args.output_dir),
+        llm=LocalLLMConfig(
+            backend=args.llm_backend,
+            model=args.llm_model,
+            max_candidates=args.llm_max_candidates,
+            temperature=args.llm_temperature,
+            max_new_tokens=args.llm_max_new_tokens,
+            timeout_seconds=args.llm_timeout_seconds,
+            fallback_to_heuristic=not args.no_llm_fallback,
+            generation_retries=args.llm_generation_retries,
+        ),
         judge_llm=LocalLLMConfig(
             backend=args.judge_llm_backend,
             model=args.judge_llm_model,

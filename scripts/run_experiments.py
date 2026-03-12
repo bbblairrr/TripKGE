@@ -47,11 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--llm-max-new-tokens", type=int, default=768)
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument("--llm-generation-retries", type=int, default=3)
     parser.add_argument(
         "--no-llm-fallback",
         action="store_true",
         help="Fail instead of falling back to heuristic planning when local LLM planning errors.",
     )
+    parser.add_argument("--resume", action="store_true", help="Resume from existing per-method prediction files in --output-dir")
     parser.add_argument("--judge-llm-backend", default=None, choices=["ollama", "transformers"])
     parser.add_argument("--judge-llm-model", default=None, help="Local judge model used for personalization comparison")
     parser.add_argument("--judge-llm-temperature", type=float, default=0.0)
@@ -111,6 +113,7 @@ def build_llm_runs(args: argparse.Namespace) -> list[LocalLLMConfig]:
             max_new_tokens=args.llm_max_new_tokens,
             timeout_seconds=args.llm_timeout_seconds,
             fallback_to_heuristic=not args.no_llm_fallback,
+            generation_retries=args.llm_generation_retries,
         )
         for model in models
     ]
@@ -237,6 +240,7 @@ def main() -> None:
             limit=args.limit,
             show_progress=args.show_progress,
             progress_every=args.progress_every,
+            resume=args.resume,
         )
         all_runs[model_label] = summary
 

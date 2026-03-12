@@ -79,6 +79,7 @@ class TripTailorGraphRAGPipeline:
         limit: int | None = None,
         show_progress: bool = False,
         progress_every: int = 10,
+        resume: bool = False,
     ) -> dict[str, Any]:
         target_methods = methods or METHODS
         results: dict[str, Any] = {
@@ -115,6 +116,7 @@ class TripTailorGraphRAGPipeline:
                 limit=limit,
                 show_progress=show_progress,
                 progress_every=progress_every,
+                resume=resume,
             )
             all_sample_metrics[method] = sample_metrics
             all_outputs[method] = sample_outputs
@@ -171,31 +173,65 @@ class TripTailorGraphRAGPipeline:
         limit: int | None = None,
         show_progress: bool = False,
         progress_every: int = 10,
+        resume: bool = False,
     ) -> tuple[list[SampleMetric], list[dict[str, Any]]]:
         metrics: list[SampleMetric] = []
         outputs: list[dict[str, Any]] = []
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{method}_predictions.jsonl"
+        completed_pids: set[int] = set()
+
+        if resume and output_path.exists():
+            with output_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    pid = int(row["pid"])
+                    completed_pids.add(pid)
+                    outputs.append(row)
+                    metrics.append(
+                        SampleMetric(
+                            pid=pid,
+                            method=row.get("method", method),
+                            values=dict(row.get("metrics") or {}),
+                            details=dict(row.get("metric_details") or {}),
+                        )
+                    )
 
         samples = self.bundle.test_samples[:limit] if limit else self.bundle.test_samples
         total = len(samples)
         started = time.perf_counter()
         if show_progress:
-            print(f"[{method}] starting {total} samples...", flush=True)
-        for idx, sample in enumerate(samples, start=1):
-            pid = int(sample["pid"])
-            query = self.query_by_pid[pid]
-            plan, run_trace = self._run_one(query, sample, method)
-            metric = compute_sample_metrics(
-                method=method,
-                query=query,
-                plan=plan,
-                sample=sample,
-                candidate_pool=self.bundle.candidates_by_pid[pid],
-                info=self.bundle.info_by_pid.get(str(pid), {}),
-                preference_judge=self.preference_judge,
-            )
-            metrics.append(metric)
-            outputs.append(
-                {
+            if completed_pids:
+                print(
+                    f"[{method}] resuming with {len(completed_pids)} completed and {total - len(completed_pids)} remaining samples...",
+                    flush=True,
+                )
+            else:
+                print(f"[{method}] starting {total} samples...", flush=True)
+        file_mode = "a" if resume and output_path.exists() else "w"
+        with output_path.open(file_mode, encoding="utf-8") as sink:
+            processed = len(completed_pids)
+            for sample in samples:
+                pid = int(sample["pid"])
+                if pid in completed_pids:
+                    continue
+                query = self.query_by_pid[pid]
+                plan, run_trace = self._run_one(query, sample, method)
+                metric = compute_sample_metrics(
+                    method=method,
+                    query=query,
+                    plan=plan,
+                    sample=sample,
+                    candidate_pool=self.bundle.candidates_by_pid[pid],
+                    info=self.bundle.info_by_pid.get(str(pid), {}),
+                    preference_judge=self.preference_judge,
+                )
+                metrics.append(metric)
+                row = {
                     "pid": pid,
                     "method": method,
                     "metrics": metric.values,
@@ -203,16 +239,19 @@ class TripTailorGraphRAGPipeline:
                     "plan": asdict(plan),
                     "diagnostics": self._build_sample_diagnostics(run_trace, plan, metric),
                 }
-            )
-            if show_progress and (idx == total or idx == 1 or idx % max(1, progress_every) == 0):
-                elapsed = time.perf_counter() - started
-                rate = elapsed / idx if idx else 0.0
-                eta = max(0.0, rate * (total - idx))
-                print(
-                    f"[{method}] {idx}/{total} pid={pid} "
-                    f"planner={plan.planner_mode} elapsed={elapsed:.1f}s eta={eta:.1f}s",
-                    flush=True,
-                )
+                outputs.append(row)
+                sink.write(json.dumps(row, ensure_ascii=False) + "\n")
+                sink.flush()
+                processed += 1
+                if show_progress and (processed == total or processed == 1 or processed % max(1, progress_every) == 0):
+                    elapsed = time.perf_counter() - started
+                    rate = elapsed / max(1, processed - len(completed_pids))
+                    eta = max(0.0, rate * (total - processed))
+                    print(
+                        f"[{method}] {processed}/{total} pid={pid} "
+                        f"planner={plan.planner_mode} elapsed={elapsed:.1f}s eta={eta:.1f}s",
+                        flush=True,
+                    )
 
         return metrics, outputs
 

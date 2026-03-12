@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -91,29 +92,41 @@ class PlanGenerator:
         info: dict[str, Any],
         cindex: CandidateIndex,
     ) -> tuple[PlanResult | None, str | None]:
-        try:
-            transportation = self._pick_transport(query, info)
-            prompt = self._build_llm_prompt(query, summary, candidate_pool, cindex, transportation)
-            response = self.llm_client.generate(prompt, system_prompt=self._llm_system_prompt())
-            payload = self._parse_llm_json(response)
-            hotel_entry = self._llm_pick_hotel(payload, query, summary, cindex)
-            itinerary = self._llm_build_itinerary(payload, query, summary, cindex, transportation)
-            itinerary = self._schedule_itinerary(query, itinerary, transportation, cindex, summary.chosen_ids)
-            return PlanResult(
-                query_pid=query.pid,
-                hotel=hotel_entry,
-                transportation=transportation,
-                itinerary=itinerary,
-                candidate_pool=[c.candidate_id for c in candidate_pool],
-                evidence_ids=summary.chosen_ids,
-                validator_report={},
-                planner_mode="llm",
-                planning_error=None,
-            ), None
-        except (LocalLLMError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            if not self.config.llm.fallback_to_heuristic:
-                raise
-            return None, str(exc)
+        transportation = self._pick_transport(query, info)
+        base_prompt = self._build_llm_prompt(query, summary, candidate_pool, cindex, transportation)
+        last_error: Exception | None = None
+        last_response = ""
+        attempts = max(1, self.config.llm.generation_retries)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                prompt = self._build_llm_retry_prompt(base_prompt, last_response, str(last_error) if last_error else None, attempt)
+                response = self.llm_client.generate(prompt, system_prompt=self._llm_system_prompt())
+                last_response = response
+                payload = self._parse_llm_json_with_retries(response)
+                hotel_entry = self._llm_pick_hotel(payload, query, summary, cindex)
+                itinerary = self._llm_build_itinerary(payload, query, summary, cindex, transportation)
+                itinerary = self._schedule_itinerary(query, itinerary, transportation, cindex, summary.chosen_ids)
+                return PlanResult(
+                    query_pid=query.pid,
+                    hotel=hotel_entry,
+                    transportation=transportation,
+                    itinerary=itinerary,
+                    candidate_pool=[c.candidate_id for c in candidate_pool],
+                    evidence_ids=summary.chosen_ids,
+                    validator_report={},
+                    planner_mode="llm",
+                    planning_error=None,
+                ), None
+            except (LocalLLMError, ValueError, KeyError, SyntaxError, json.JSONDecodeError) as exc:
+                last_error = exc
+                self._dump_llm_failure(query.pid, attempt, last_response, str(exc))
+
+        if not self.config.llm.fallback_to_heuristic:
+            raise ValueError(
+                f"LLM planning failed after {attempts} attempts for pid={query.pid}: {last_error}"
+            )
+        return None, str(last_error) if last_error else "LLM planning failed."
 
     def _build_index(self, candidate_pool: list[Candidate]) -> CandidateIndex:
         by_id = {c.candidate_id: c for c in candidate_pool}
@@ -716,17 +729,175 @@ class PlanGenerator:
             + json.dumps(output_schema, ensure_ascii=False, indent=2)
         )
 
+    def _parse_llm_json_with_retries(self, text: str) -> dict[str, Any]:
+        current = text
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                return self._parse_llm_json(current)
+            except ValueError as exc:
+                last_error = exc
+                repair_prompt = self._build_llm_json_repair_prompt(current, error_message=str(exc))
+                current = self.llm_client.generate(repair_prompt, system_prompt=self._llm_json_repair_system_prompt())
+        raise ValueError(str(last_error) if last_error else "Unable to parse LLM output as JSON.")
+
     def _parse_llm_json(self, text: str) -> dict[str, Any]:
+        cleaned = self._strip_llm_json_wrapper(text)
+        candidates: list[str] = []
+        if cleaned:
+            candidates.append(cleaned)
+        extracted = self._extract_balanced_json_object(cleaned)
+        if extracted and extracted not in candidates:
+            candidates.append(extracted)
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            for parser in (self._parse_strict_json, self._parse_python_style_json):
+                try:
+                    payload = parser(candidate)
+                except (ValueError, SyntaxError, json.JSONDecodeError) as exc:
+                    last_error = exc
+                    continue
+                if isinstance(payload, dict):
+                    return payload
+                last_error = ValueError("LLM output root must be a JSON object.")
+
+        error_msg = f"Unable to parse LLM output as JSON: {last_error}" if last_error else "Unable to parse LLM output as JSON."
+        raise ValueError(error_msg)
+
+    def _parse_strict_json(self, text: str) -> dict[str, Any]:
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("LLM output root must be a JSON object.")
+        return payload
+
+    def _parse_python_style_json(self, text: str) -> dict[str, Any]:
+        repaired = self._repair_json_like_text(text)
+        payload = ast.literal_eval(repaired)
+        if not isinstance(payload, dict):
+            raise ValueError("LLM output root must be a mapping.")
+        return payload
+
+    def _strip_llm_json_wrapper(self, text: str) -> str:
         cleaned = text.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-            if not match:
-                raise
-            return json.loads(match.group(0))
+        cleaned = cleaned.replace("\ufeff", "")
+        cleaned = cleaned.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+        return cleaned
+
+    def _extract_balanced_json_object(self, text: str) -> str | None:
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        quote_char = ""
+        escaped = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote_char:
+                    in_string = False
+                continue
+            if ch in {'"', "'"}:
+                in_string = True
+                quote_char = ch
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
+
+    def _repair_json_like_text(self, text: str) -> str:
+        repaired = text.strip()
+        repaired = repaired.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+        repaired = re.sub(r"(?m)^\s*(//|#).*$", "", repaired)
+        repaired = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)", r'\1"\2"\3', repaired)
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+        repaired = re.sub(r"(?<![A-Za-z0-9_\"'])\btrue\b", "True", repaired)
+        repaired = re.sub(r"(?<![A-Za-z0-9_\"'])\bfalse\b", "False", repaired)
+        repaired = re.sub(r"(?<![A-Za-z0-9_\"'])\bnull\b", "None", repaired)
+
+        def quote_bare_value(match: re.Match[str]) -> str:
+            prefix, value, suffix = match.groups()
+            value = value.strip()
+            if not value:
+                return f'{prefix}""{suffix}'
+            if value.startswith(('"', "'", "{", "[")):
+                return f"{prefix}{value}{suffix}"
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", value):
+                return f"{prefix}{value}{suffix}"
+            if value in {"True", "False", "None"}:
+                return f"{prefix}{value}{suffix}"
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'{prefix}"{escaped}"{suffix}'
+
+        repaired = re.sub(
+            r'(:\s*)([^,\[\]\{\}\n][^,\}\]\n]*?)(\s*[,}\]])',
+            quote_bare_value,
+            repaired,
+        )
+        return repaired
+
+    def _llm_json_repair_system_prompt(self) -> str:
+        return (
+            "You repair malformed JSON. Output exactly one valid JSON object and nothing else. "
+            "Use double quotes for every key and every string value."
+        )
+
+    def _build_llm_retry_prompt(
+        self,
+        base_prompt: str,
+        last_response: str,
+        error_message: str | None,
+        attempt: int,
+    ) -> str:
+        if attempt <= 1:
+            return base_prompt
+        error_line = f"Previous parser/planning error: {error_message}\n\n" if error_message else ""
+        previous_line = f"Previous invalid output:\n{last_response}\n\n" if last_response else ""
+        return (
+            base_prompt
+            + "\n\nIMPORTANT: Your previous answer was invalid. Retry and return exactly one valid JSON object."
+            + "\nDo not include markdown fences, comments, explanations, or trailing commas.\n\n"
+            + error_line
+            + previous_line
+        )
+
+    def _build_llm_json_repair_prompt(self, raw_response: str, error_message: str | None = None) -> str:
+        error_line = f"Parser error: {error_message}\n\n" if error_message else ""
+        return (
+            "Rewrite the following malformed planner response as valid JSON only.\n"
+            "Requirements:\n"
+            "- Output exactly one JSON object\n"
+            "- Use double quotes for every key and every string value\n"
+            "- Keep the same semantic content when possible\n"
+            "- Do not add explanation, markdown fences, or comments\n\n"
+            + error_line
+            + "Response to repair:\n"
+            + raw_response
+        )
+
+    def _dump_llm_failure(self, pid: int, attempt: int, response: str, error_message: str) -> None:
+        dump_dir = self.config.output_dir / "llm_failures"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        path = dump_dir / f"pid_{pid}_attempt_{attempt}.txt"
+        payload = (
+            f"pid={pid}\n"
+            f"attempt={attempt}\n"
+            f"error={error_message}\n"
+            "response:\n"
+            f"{response}"
+        )
+        path.write_text(payload, encoding="utf-8")
 
     def _resolve_candidate_ref(
         self,

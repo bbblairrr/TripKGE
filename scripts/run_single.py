@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-temperature", type=float, default=0.0)
     parser.add_argument("--llm-max-new-tokens", type=int, default=768)
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument("--llm-generation-retries", type=int, default=3)
     parser.add_argument(
         "--no-llm-fallback",
         action="store_true",
@@ -67,6 +68,7 @@ def main() -> None:
         max_new_tokens=args.llm_max_new_tokens,
         timeout_seconds=args.llm_timeout_seconds,
         fallback_to_heuristic=not args.no_llm_fallback,
+        generation_retries=args.llm_generation_retries,
     )
     judge_llm_cfg = LocalLLMConfig(
         backend=args.judge_llm_backend,
