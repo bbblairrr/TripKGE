@@ -147,6 +147,8 @@ python3 scripts/run_ablation.py \
 默认写入 `outputs/`：
 - `experiment_summary.json`
 - `<method>_predictions.jsonl`
+- `comparison_runs.csv` / `comparison_runs.jsonl`（当同时比较多个本地模型或多个 hop 时自动生成）
+- `comparison_summary.json`（汇总每个 method 在不同模型与 hop 下的最优结果）
 
 ## 5. 目录结构
 
@@ -252,6 +254,49 @@ Notes:
 - With `--judge-llm-backend` and `--judge-llm-model`, the personalization metric is scored by an LLM judge using blind A/B comparison between the generated itinerary and the dataset reference itinerary.
 - Without LLM arguments, the project keeps using the existing heuristic planner.
 - Multi-model comparison writes each run into `outputs/model_compare/<model_name>/`.
+- If `--compare-hops` is enabled, each run is written under `outputs/.../hop_<n>/`, and the root output directory also writes `comparison_runs.csv` and `comparison_summary.json`.
+
+Compare Qwen vs local DeepSeek only:
+
+```powershell
+python scripts\run_experiments.py `
+  --data-dir data `
+  --eval-file splits\test_final.json `
+  --methods graphrag_summary `
+  --vector-backend faiss `
+  --llm-backend ollama `
+  --llm-models qwen2.5-coder:7b deepseek-r1:8b `
+  --output-dir outputs\model_compare_qwen_vs_deepseek
+```
+
+Compare different hop settings with the same local model:
+
+```powershell
+python scripts\run_experiments.py `
+  --data-dir data `
+  --eval-file splits\test_final.json `
+  --methods graphrag_summary `
+  --vector-backend faiss `
+  --llm-backend ollama `
+  --llm-model qwen2.5-coder:7b `
+  --compare-hops 1 2 3 `
+  --output-dir outputs\hop_compare_qwen
+```
+
+Compare local models and hop settings together:
+
+```powershell
+python scripts\run_experiments.py `
+  --data-dir data `
+  --eval-file splits\test_final.json `
+  --methods graphrag_summary `
+  --vector-backend faiss `
+  --llm-backend ollama `
+  --llm-models qwen2.5-coder:7b deepseek-r1:8b `
+  --compare-hops 1 2 3 `
+  --compare-target-metric constraint_satisfaction_rate `
+  --output-dir outputs\model_hop_compare
+```
 
 ## FAISS Retrieval
 
