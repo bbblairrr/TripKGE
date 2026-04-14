@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Protocol
 
 from .config import LocalLLMConfig
+from .utils import sanitize_llm_text
 
 
 class LocalLLMError(RuntimeError):
@@ -41,7 +43,13 @@ class OllamaLocalLLM:
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
             raise LocalLLMError(f"Ollama generation failed: {stderr or 'unknown error'}")
-        return (proc.stdout or "").strip()
+        return self._sanitize_response(proc.stdout or "")
+
+    def _sanitize_response(self, text: str) -> str:
+        cleaned = sanitize_llm_text(text)
+        # Some local chat models wrap the answer with think blocks before JSON output.
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+        return cleaned
 
 
 @dataclass
@@ -98,7 +106,7 @@ class TransformersLocalLLM:
             )
         prompt_len = inputs["input_ids"].shape[-1]
         generated = outputs[0][prompt_len:]
-        return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
+        return sanitize_llm_text(self._tokenizer.decode(generated, skip_special_tokens=True))
 
 
 def build_local_llm_client(config: LocalLLMConfig) -> LocalLLMClient | None:

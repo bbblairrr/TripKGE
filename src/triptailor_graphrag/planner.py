@@ -10,7 +10,14 @@ from .config import ExperimentConfig
 from .local_llm import LocalLLMClient, LocalLLMError
 from .pattern import PatternMiner
 from .types import Candidate, EvidenceSummary, PlanResult, QuerySpec
-from .utils import format_time_range, normalize_text, parse_duration_minutes, parse_opening_hours, parse_time_range
+from .utils import (
+    format_time_range,
+    normalize_text,
+    parse_duration_minutes,
+    parse_opening_hours,
+    parse_time_range,
+    sanitize_llm_text,
+)
 
 
 @dataclass
@@ -730,7 +737,7 @@ class PlanGenerator:
         )
 
     def _parse_llm_json_with_retries(self, text: str) -> dict[str, Any]:
-        current = text
+        current = sanitize_llm_text(text)
         last_error: Exception | None = None
         for _ in range(3):
             try:
@@ -738,7 +745,9 @@ class PlanGenerator:
             except ValueError as exc:
                 last_error = exc
                 repair_prompt = self._build_llm_json_repair_prompt(current, error_message=str(exc))
-                current = self.llm_client.generate(repair_prompt, system_prompt=self._llm_json_repair_system_prompt())
+                current = sanitize_llm_text(
+                    self.llm_client.generate(repair_prompt, system_prompt=self._llm_json_repair_system_prompt())
+                )
         raise ValueError(str(last_error) if last_error else "Unable to parse LLM output as JSON.")
 
     def _parse_llm_json(self, text: str) -> dict[str, Any]:
@@ -761,6 +770,12 @@ class PlanGenerator:
                 if isinstance(payload, dict):
                     return payload
                 last_error = ValueError("LLM output root must be a JSON object.")
+            try:
+                payload = self._parse_planner_schema_fallback(candidate)
+            except ValueError as exc:
+                last_error = exc
+            else:
+                return payload
 
         error_msg = f"Unable to parse LLM output as JSON: {last_error}" if last_error else "Unable to parse LLM output as JSON."
         raise ValueError(error_msg)
@@ -779,10 +794,9 @@ class PlanGenerator:
         return payload
 
     def _strip_llm_json_wrapper(self, text: str) -> str:
-        cleaned = text.strip()
+        cleaned = sanitize_llm_text(text)
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
-        cleaned = cleaned.replace("\ufeff", "")
         cleaned = cleaned.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
         return cleaned
 
@@ -817,7 +831,7 @@ class PlanGenerator:
         return None
 
     def _repair_json_like_text(self, text: str) -> str:
-        repaired = text.strip()
+        repaired = sanitize_llm_text(text)
         repaired = repaired.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
         repaired = re.sub(r"(?m)^\s*(//|#).*$", "", repaired)
         repaired = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)", r'\1"\2"\3', repaired)
@@ -846,6 +860,76 @@ class PlanGenerator:
             repaired,
         )
         return repaired
+
+    def _parse_planner_schema_fallback(self, text: str) -> dict[str, Any]:
+        cleaned = sanitize_llm_text(text)
+        hotel_match = re.search(r'"hotel_candidate_id"\s*:\s*"([^"\n]+)"', cleaned)
+        hotel_candidate_id = hotel_match.group(1).strip() if hotel_match else ""
+
+        day_pattern = re.compile(r'^\s*"(\d+)"\s*:\s*\[\s*$', re.MULTILINE)
+        candidate_pattern = re.compile(r'"candidate_id"\s*:\s*"([^"\n]+)')
+        action_pattern = re.compile(r'"action"\s*:\s*"([A-Za-z_ -]+)')
+        standalone_action_pattern = re.compile(r'^\s*"?(sightseeing|dining)"?\s*$')
+        valid_actions = {"sightseeing", "dining"}
+
+        days: dict[str, list[dict[str, str]]] = {}
+        current_day: str | None = None
+        pending_candidate_id: str | None = None
+        lines = cleaned.splitlines()
+
+        for idx, line in enumerate(lines):
+            day_match = day_pattern.match(line)
+            if day_match:
+                current_day = day_match.group(1)
+                days.setdefault(current_day, [])
+                pending_candidate_id = None
+                continue
+
+            if current_day is None:
+                continue
+
+            candidate_match = candidate_pattern.search(line)
+            if candidate_match:
+                pending_candidate_id = candidate_match.group(1).strip()
+                continue
+
+            action_match = action_pattern.search(line)
+            action_value: str | None = None
+            if action_match:
+                raw_action = action_match.group(1).strip().lower()
+                if raw_action in valid_actions:
+                    action_value = raw_action
+                else:
+                    for look_ahead in lines[idx + 1 : min(len(lines), idx + 3)]:
+                        standalone_match = standalone_action_pattern.match(look_ahead.strip().lower())
+                        if standalone_match:
+                            action_value = standalone_match.group(1)
+                            break
+                    if action_value is None:
+                        if raw_action.startswith("din"):
+                            action_value = "dining"
+                        elif raw_action.startswith("sight"):
+                            action_value = "sightseeing"
+
+            if pending_candidate_id and action_value:
+                days.setdefault(current_day, []).append(
+                    {
+                        "candidate_id": pending_candidate_id,
+                        "action": action_value,
+                    }
+                )
+                pending_candidate_id = None
+
+            if line.strip().startswith("]"):
+                current_day = None
+                pending_candidate_id = None
+
+        if not hotel_candidate_id and not any(days.values()):
+            raise ValueError("Unable to recover planner schema from malformed LLM output.")
+        return {
+            "hotel_candidate_id": hotel_candidate_id,
+            "days": days,
+        }
 
     def _llm_json_repair_system_prompt(self) -> str:
         return (
@@ -883,7 +967,7 @@ class PlanGenerator:
             "- Do not add explanation, markdown fences, or comments\n\n"
             + error_line
             + "Response to repair:\n"
-            + raw_response
+            + sanitize_llm_text(raw_response)
         )
 
     def _dump_llm_failure(self, pid: int, attempt: int, response: str, error_message: str) -> None:
@@ -895,7 +979,7 @@ class PlanGenerator:
             f"attempt={attempt}\n"
             f"error={error_message}\n"
             "response:\n"
-            f"{response}"
+            f"{sanitize_llm_text(response)}"
         )
         path.write_text(payload, encoding="utf-8")
 

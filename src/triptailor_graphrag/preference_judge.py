@@ -8,6 +8,7 @@ from typing import Any
 
 from .local_llm import LocalLLMClient, LocalLLMError
 from .types import Candidate, PlanResult, QuerySpec
+from .utils import sanitize_llm_text
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,7 @@ class PreferenceJudge:
         return {"a_text": reference_text, "b_text": generated_text, "a_is_generated": False}
 
     def _parse_json(self, text: str) -> dict[str, Any]:
-        cleaned = text.strip()
+        cleaned = sanitize_llm_text(text)
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
         try:

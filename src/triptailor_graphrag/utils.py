@@ -14,6 +14,11 @@ DURATION_SINGLE_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(minutes?|hours?|
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]", re.IGNORECASE)
 TIME_RANGE_PATTERN = re.compile(r"(\d{1,2}:\d{2})\s*(?:-|to)\s*(\d{1,2}:\d{2})", re.IGNORECASE)
 BUDGET_PATTERN = re.compile(r"budget of [楼$]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+ANSI_ESCAPE_PATTERN = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\))"
+)
+CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+ZERO_WIDTH_PATTERN = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
 MEAL_RANGE_PATTERN = re.compile(
     r"meal costs?\s*(?:ranging from)?\s*[楼$]?\s*([0-9]+)\s*(?:to|-)\s*[楼$]?\s*([0-9]+)",
     re.IGNORECASE,
@@ -58,6 +63,16 @@ def slugify(text: str | None) -> str:
 def tokenize(text: str | None) -> list[str]:
     normalized = normalize_text(text)
     return TOKEN_PATTERN.findall(normalized)
+
+
+def sanitize_llm_text(text: str | None) -> str:
+    if not text:
+        return ""
+    cleaned = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = ANSI_ESCAPE_PATTERN.sub("", cleaned)
+    cleaned = ZERO_WIDTH_PATTERN.sub("", cleaned)
+    cleaned = CONTROL_CHAR_PATTERN.sub("", cleaned)
+    return cleaned.strip()
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
